@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>লগইন - সোলার পাওয়ার ম্যানেজমেন্ট</title>
+
+<!-- Firebase SDK -->
+<script src="https://www.gstatic.com/firebasejs/9.8.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.8.0/firebase-auth-compat.js"></script>
+<link rel="stylesheet" href="login.css">
+
+</head>
+<body>
+
+<div class="login-container">
+
+    <h1>☀️ সোলার ড্যাশবোর্ড</h1>
+    <p>স্মার্ট সোলার পাওয়ার ম্যানেজমেন্ট সিস্টেম</p>
+
+    <!-- Login Box -->
+    <div id="loginBox">
+        <h2>অ্যাকাউন্টে লগইন করুন</h2>
+        <form id="loginForm">
+            <div class="form-group">
+                <label>ইমেইল ঠিকানা</label>
+                <input type="email" id="loginEmail" placeholder="আপনার ইমেইল দিন" required>
+            </div>
+            <div class="form-group">
+                <label>পাসওয়ার্ড</label>
+                <input type="password" id="loginPassword" placeholder="পাসওয়ার্ড দিন" required>
+                <div class="password-toggle" onclick="togglePassword('loginPassword')">👁️</div>
+            </div>
+            <button type="submit">লগইন</button>
+        </form>
+
+        <div class="divider">অথবা</div>
+        <button class="google-login-btn" onclick="handleGoogleLogin()">
+            <img src="https://img.icons8.com/color/16/000000/google-logo.png" alt="Google">
+            Google দিয়ে লগইন
+        </button>
+
+        <a class="forgot-password" onclick="showForgotPassword()">পাসওয়ার্ড ভুলে গেছেন?</a>
+        <p class="register-link" onclick="showRegister()">নতুন অ্যাকাউন্ট তৈরি করুন</p>
+    </div>
+
+    <!-- Register Box -->
+    <div id="registerBox" style="display:none;">
+        <h2>নতুন অ্যাকাউন্ট তৈরি করুন</h2>
+        <div class="form-group">
+            <label>ইমেইল ঠিকানা</label>
+            <input type="email" id="registerEmail" placeholder="ইমেইল দিন">
+        </div>
+        <div class="form-group">
+            <label>পাসওয়ার্ড</label>
+            <input type="password" id="registerPassword" placeholder="পাসওয়ার্ড দিন">
+            <div class="password-toggle" onclick="togglePassword('registerPassword')">👁️</div>
+        </div>
+        <div class="form-group">
+            <label>পাসওয়ার্ড নিশ্চিত করুন</label>
+            <input type="password" id="confirmPassword" placeholder="পাসওয়ার্ড আবার দিন">
+            <div class="password-toggle" onclick="togglePassword('confirmPassword')">👁️</div>
+        </div>
+        <div class="form-group">
+            <label>পুরো নাম (ঐচ্ছিক)</label>
+            <input type="text" id="fullName" placeholder="আপনার নাম">
+        </div>
+        <label><input type="checkbox" id="acceptTerms"> আমি সেবা শর্তাবলী ও গোপনীয়তা নীতি মেনে নিয়েছি</label>
+        <button class="register-btn">রেজিস্টার করুন</button>
+        <p class="login-link" onclick="showLogin()">ইতিমধ্যে অ্যাকাউন্ট আছে? লগইন করুন</p>
+    </div>
+
+    <!-- Forgot Password Box -->
+    <div id="forgotPasswordBox" style="display:none;">
+        <h2>পাসওয়ার্ড রিসেট করুন</h2>
+        <div class="form-group">
+            <label>ইমেইল ঠিকানা</label>
+            <input type="email" id="resetEmail" placeholder="আপনার রেজিস্টার্ড ইমেইল">
+        </div>
+        <button class="reset-btn">পাসওয়ার্ড রিসেট লিংক পাঠান</button>
+        <p class="login-link" onclick="showLogin()">← লগইন পেজে ফিরে যান</p>
+    </div>
+
+</div>
+
+<div id="notification"></div>
+
+<script>
+/* ============== Firebase Config ============== */
+const firebaseConfig = {
+    apiKey: "AIzaSyBP9zk3Y8wBBCfvnRKmcExMP-uIbINuTwc",
+    authDomain: "solar-panel-c798c.firebaseapp.com",
+    databaseURL: "https://solar-panel-c798c-default-rtdb.asia-southeast1.firebasedatabase.app",
+    projectId: "solar-panel-c798c",
+    storageBucket: "solar-panel-c798c.appspot.com",
+    messagingSenderId: "619952775462",
+    appId: "1:619952775462:web:8e127954fd3cefef2c21e7",
+    measurementId: "G-EXYX7GPPR5"
+};
+
+
+firebase.initializeApp(firebaseConfig);
+
+/* ============== Helper Functions ============== */
+function togglePassword(id) {
+    const input = document.getElementById(id);
+    input.type = input.type==='password'?'text':'password';
+}
+function showNotification(msg, type='info'){
+    const el=document.getElementById('notification');
+    if(!el){alert(msg);return;}
+    el.textContent=msg; el.className=type; el.classList.add('show');
+    setTimeout(()=>el.classList.remove('show'),3000);
+}
+function showLogin(){document.getElementById('loginBox').style.display='block';document.getElementById('registerBox').style.display='none';document.getElementById('forgotPasswordBox').style.display='none';}
+function showRegister(){document.getElementById('loginBox').style.display='none';document.getElementById('registerBox').style.display='block';document.getElementById('forgotPasswordBox').style.display='none';}
+function showForgotPassword(){document.getElementById('loginBox').style.display='none';document.getElementById('registerBox').style.display='none';document.getElementById('forgotPasswordBox').style.display='block';}
+
+/* ============== Login / Register / Reset ============== */
+document.getElementById('loginForm').addEventListener('submit', e=>{
+    e.preventDefault();
+    const email=document.getElementById('loginEmail').value.trim();
+    const password=document.getElementById('loginPassword').value;
+    if(!email||!password){showNotification('ইমেইল এবং পাসওয়ার্ড দিন','error');return;}
+    showNotification('লগইন করা হচ্ছে...','info');
+    firebase.auth().signInWithEmailAndPassword(email,password)
+    .then(res=>{
+        showNotification('লগইন সফল!','success');
+        setTimeout(()=>window.location.href='Solar.html',700);
+    }).catch(err=>{
+        showNotification(err.message,'error');
+    });
+});
+
+/* Register */
+document.querySelector('.register-btn').addEventListener('click', e=>{
+    e.preventDefault();
+    const email=document.getElementById('registerEmail').value.trim();
+    const password=document.getElementById('registerPassword').value;
+    const confirmPassword=document.getElementById('confirmPassword').value;
+    const fullName=document.getElementById('fullName').value.trim();
+    const terms=document.getElementById('acceptTerms');
+    if(!email||!password){showNotification('ইমেইল এবং পাসওয়ার্ড দিন','error');return;}
+    if(password!==confirmPassword){showNotification('পাসওয়ার্ড মিলছে না','error');return;}
+    if(password.length<6){showNotification('পাসওয়ার্ড ৬+ অক্ষর','error');return;}
+    if(!terms.checked){showNotification('সেবা শর্তাবলী গ্রহণ করুন','error');return;}
+    showNotification('অ্যাকাউন্ট তৈরি হচ্ছে...','info');
+    firebase.auth().createUserWithEmailAndPassword(email,password)
+    .then(res=>{
+        if(fullName){res.user.updateProfile({displayName:fullName});}
+        showNotification('রেজিস্টারেশন সফল!','success');
+        setTimeout(()=>window.location.href='Solar.html',700);
+    }).catch(err=>showNotification(err.message,'error'));
+});
+
+/* Reset Password */
+document.querySelector('.reset-btn').addEventListener('click', e=>{
+    e.preventDefault();
+    const email=document.getElementById('resetEmail').value.trim();
+    if(!email){showNotification('ইমেইল দিন','error');return;}
+    showNotification('রিসেট লিংক পাঠানো হচ্ছে...','info');
+    firebase.auth().sendPasswordResetEmail(email)
+    .then(()=>{showNotification('রিসেট লিংক পাঠানো হয়েছে','success'); showLogin();})
+    .catch(err=>showNotification(err.message,'error'));
+});
+
+/* Google Login */
+function handleGoogleLogin(){
+    const provider=new firebase.auth.GoogleAuthProvider();
+    showNotification('Google লগইন...','info');
+    firebase.auth().signInWithPopup(provider)
+    .then(res=>{
+        showNotification('Google লগইন সফল!','success');
+        setTimeout(()=>window.location.href='Solar.html',700);
+    }).catch(err=>showNotification(err.message,'error'));
+}
+</script>
+
+</body>
+</html>
