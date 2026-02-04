@@ -1,4 +1,6 @@
-// dashboard.js - Smart Auto Power Switching with Firebase Data Only
+// dashboard.js - Complete Solar Smart Controller Dashboard
+// All features working - Energy, History, Alerts, Charts, Power Control
+// Firebase Only - No Local Storage
 
 // ==================== GLOBAL VARIABLES ====================
 let database;
@@ -18,8 +20,7 @@ let lastPowerSource = 'grid';
 let currentBrushMode = 'auto';
 let isSwitchingInProgress = false;
 let lastSwitchTime = 0;
-const MIN_SWITCH_INTERVAL = 15000; // 15 seconds minimum between switches
-
+const MIN_SWITCH_INTERVAL = 10000; // 10 seconds minimum between isSwitchingInProgress
 // System status
 let brushStatus = 'stopped';
 let pumpStatus = 'off';
@@ -33,97 +34,87 @@ let batteryCurrent = 0;
 let loadCurrent = 0;
 let lastValidDataTime = 0;
 
+// Energy calculation
+let totalEnergyWh = 0;
+let lastEnergyUpdateTime = 0;
+const ENERGY_UPDATE_INTERVAL = 5000; // 5 seconds
+
 // User variables
 let userId = null;
+let userEmail = null;
 
-// Auto mode thresholds
+// Auto mode thresholds - UPDATED FOR SOLAR PRIORITY
 const AUTO_THRESHOLDS = {
-    SOLAR_MIN_VOLTAGE: 12.0,         // Minimum solar voltage to consider
-    BATTERY_MIN_VOLTAGE: 11.5,       // Minimum battery voltage to use
-    BATTERY_CRITICAL_SOC: 20,        // Switch to grid if below this
-    BATTERY_LOW_SOC: 30,             // Prefer solar if battery low
-    SOLAR_BATTERY_DIFF: 0.5,         // Solar must be this much higher than battery
-    HYSTERESIS: 0.2,                 // Prevent rapid switching
-    DATA_TIMEOUT: 60000,             // 60 seconds without data
-    MIN_SOLAR_VOLTAGE_FOR_SWITCH: 13.0, // Solar voltage must be at least this to switch from grid
-    GRID_TO_SOLAR_THRESHOLD: 1.0,    // Solar must be 1.0V higher than battery to switch from grid to solar
-    SOLAR_TO_GRID_THRESHOLD: 10.0    // Solar must be below 10.0V to switch to grid
+    SOLAR_MIN_VOLTAGE: 12.0,
+    BATTERY_MIN_VOLTAGE: 11.5,
+    BATTERY_CRITICAL_SOC: 20,
+    BATTERY_LOW_SOC: 30,
+    SOLAR_BATTERY_DIFF: 0.5,
+    HYSTERESIS: 0.3,  // Increased to prevent frequent switching
+    DATA_TIMEOUT: 60000,
+    MIN_SOLAR_VOLTAGE_FOR_SWITCH: 13.0,
+    GRID_TO_SOLAR_THRESHOLD: 1.0,
+    SOLAR_TO_GRID_THRESHOLD: 11.5,  // Increased from 10.0V to 11.5V
+    BATTERY_TO_GRID_THRESHOLD: 11.0,
+    SOLAR_MIN_FOR_OPERATION: 12.5,  // New: Minimum solar voltage to stay on solar
+    SOLAR_PRIORITY_MODE: true  // New: Solar priority mode enabled
 };
+
+// Button state management
+let buttonStates = {
+    mode: { auto: false, manual: false, stop: false },
+    power: { solar: false, battery: false, grid: false, auto: false, all_off: false, stop: false },
+    brush: { auto: false, manual: false, forward: false, reverse: false, stop: false },
+    pump: { on: false, off: false },
+    cleaning: { start: false, stop: false }
+};
+
+// Chart variables
+let voltageChart = null;
+let currentChart = null;
+let timeLabels = [];
+const chartDataPoints = 20;
+
+// Firebase Connection Manager
+let firebaseConnectionManager = null;
+let lastAutoCheckTime = 0;
+let autoModeStartTime = 0;
+let retryCount = 0;
+const MAX_RETRY_COUNT = 3;
+
+// Solar priority tracking
+let solarPriorityBlockCount = 0;
+let lastSolarPriorityBlockTime = 0;
+
+// Alerts system
+let alerts = [];
+const MAX_ALERTS = 10;
 
 // ==================== MAIN INITIALIZATION ====================
 
-document.addEventListener('DOMContentLoaded', function() {
-    console.log("🚀 Solar Dashboard loading...");
-    initializeDashboard();
-});
-
 function initializeDashboard() {
-    console.log("📊 Initializing dashboard...");
+    console.log("🚀 Solar Dashboard initializing...");
     
     // Clear any existing intervals first
     stopAllIntervals();
     
     // Initialize Firebase
-    let firebaseInitialized = initializeFirebaseCompat();
-    
-    if (!firebaseInitialized) {
+    if (!initializeFirebase()) {
         showNotification("Firebase শুরু করা যায়নি", "error");
         return;
     }
     
-    // Check authentication
-    checkAuthCompat().then((user) => {
-        console.log("✅ User authenticated:", user.email);
-        
-        // Set user info
-        const userEmailElement = document.getElementById('userEmailDisplay');
-        if (userEmailElement) {
-            userEmailElement.textContent = user.email;
-        }
-        userId = user.uid;
-        
-        // Initialize database connection
-        initDatabaseCompat();
-        
-        // Initialize control panel
-        setTimeout(() => {
-            initControlPanel();
-            testAllButtons();
-            
-            // Start with manual mode
-            updateModeUI('manual');
-            updateActivePowerSourceButton('grid');
-            
-            // Update system time
-            setInterval(updateSystemTime, 1000);
-            updateSystemTime();
-            
-            // Add debug button
-            addDebugButton();
-            
-            console.log("✅ Dashboard initialized successfully");
-            console.log("📊 Waiting for Firebase data...");
-            
-        }, 1000);
-        
-    }).catch((error) => {
-        console.error("❌ Authentication failed:", error);
-        showNotification("লগইন প্রয়োজন", "error");
-        setTimeout(() => {
-            window.location.href = 'login.html';
-        }, 2000);
-    });
+    // Setup the dashboard
+    setupDashboard();
 }
 
-// ==================== FIREBASE COMPAT INITIALIZATION ====================
-
-function initializeFirebaseCompat() {
+function initializeFirebase() {
     try {
         console.log("🔥 Initializing Firebase...");
         
         if (typeof firebase === 'undefined') {
             console.error("❌ Firebase SDK not loaded");
-            showNotification("Firebase লোড হয়নি", "error");
+            showNotification("Firebase SDK লোড হয়নি", "error");
             return false;
         }
         
@@ -133,18 +124,18 @@ function initializeFirebaseCompat() {
             return false;
         }
         
+        // Initialize Firebase app if not already
         if (!firebase.apps.length) {
             firebase.initializeApp(firebaseConfig);
-            console.log("✅ Firebase App Initialized");
-        } else {
-            console.log("✅ Firebase already initialized");
+            console.log("✅ Firebase app initialized");
         }
         
+        // Get Firebase instances
         auth = firebase.auth();
         database = firebase.database();
         
-        if (!database) {
-            showNotification("ডাটাবেস লোড করতে সমস্যা", "error");
+        if (!database || !auth) {
+            showNotification("Firebase সেবা লোড করতে সমস্যা", "error");
             return false;
         }
         
@@ -158,84 +149,440 @@ function initializeFirebaseCompat() {
     }
 }
 
-function checkAuthCompat() {
-    return new Promise((resolve, reject) => {
-        console.log("🔐 Checking authentication...");
+function setupDashboard() {
+    console.log("🔧 Setting up dashboard...");
+    
+    // Check user authentication from Firebase
+    if (!auth) {
+        console.error("❌ Firebase Auth not available");
+        return;
+    }
+    
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+        console.log("❌ No user authenticated");
+        return;
+    }
+    
+    // Set user info
+    userEmail = currentUser.email;
+    userId = currentUser.uid;
+    
+    console.log("✅ User authenticated:", userEmail);
+    
+    // Initialize Firebase Connection Manager
+    initializeFirebaseConnection();
+    
+    // Initialize database connection
+    initDatabaseConnection();
+    
+    // Start energy calculation
+    startEnergyCalculation();
+    
+    // Create solar priority indicator
+    createSolarPriorityIndicator();
+    
+    // Initialize control panel
+    setTimeout(() => {
+        initControlPanel();
+        testAllButtons();
         
-        const isLoggedIn = localStorage.getItem('solar_user_logged_in') === 'true';
-        const userEmail = localStorage.getItem('solar_user_email');
-        const userUid = localStorage.getItem('solar_user_uid');
+        // Start with manual mode
+        updateModeUI('manual');
+        updatePowerButtonsUI();
         
-        if (isLoggedIn && userEmail && userUid) {
-            console.log("✅ User authenticated from localStorage:", userEmail);
-            const mockUser = {
-                email: userEmail,
-                uid: userUid
-            };
-            resolve(mockUser);
-            return;
+        // Update system time
+        setInterval(updateSystemTime, 1000);
+        updateSystemTime();
+        
+        // Initialize alerts system
+        initAlertsSystem();
+        
+        // Initialize charts
+        initCharts();
+        
+        console.log("✅ Dashboard setup complete");
+        
+    }, 1000);
+}
+
+// ==================== FIREBASE CONNECTION MANAGER ====================
+
+class FirebaseConnectionManager {
+    constructor() {
+        this.isConnected = false;
+        this.lastConnectionTime = null;
+        this.connectionCheckInterval = null;
+        this.databaseRef = null;
+        this.connectionRef = null;
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 5;
+        
+        this.initConnectionMonitoring();
+    }
+    
+    initConnectionMonitoring() {
+        try {
+            // Check Firebase availability
+            if (!firebase || !firebase.database) {
+                this.updateConnectionUI(false, 'Firebase SDK লোড হয়নি');
+                return;
+            }
+            
+            // Get database reference
+            const database = firebase.database();
+            this.databaseRef = database.ref();
+            
+            // Monitor connection state
+            this.connectionRef = database.ref('.info/connected');
+            
+            this.connectionRef.on('value', (snapshot) => {
+                const connected = snapshot.val() === true;
+                this.isConnected = connected;
+                
+                if (connected) {
+                    this.handleConnected();
+                } else {
+                    this.handleDisconnected();
+                }
+            });
+            
+            // Monitor connection errors
+            database.ref('.info/connected').onDisconnect().set(false);
+            
+            // Periodic connection health check
+            this.connectionCheckInterval = setInterval(() => {
+                this.checkConnectionHealth();
+            }, 30000);
+            
+            console.log('🔗 Firebase Connection Manager initialized');
+            
+        } catch (error) {
+            console.error('❌ Firebase Connection Manager init error:', error);
+            this.updateConnectionUI(false, 'কানেকশন ত্রুটি');
+        }
+    }
+    
+    handleConnected() {
+        this.lastConnectionTime = new Date();
+        this.reconnectAttempts = 0;
+        
+        // Update last sync time
+        this.updateLastSyncTime();
+        
+        // Update UI
+        this.updateConnectionUI(true, 'Firebase সংযুক্ত');
+        
+        console.log('✅ Firebase connected at:', this.lastConnectionTime.toLocaleTimeString());
+        
+        // Show success notification
+        showNotification('Firebase সংযুক্ত হয়েছে', 'success');
+    }
+    
+    handleDisconnected() {
+        this.updateConnectionUI(false, 'Firebase সংযোগ বিচ্ছিন্ন');
+        
+        // Attempt reconnection
+        this.reconnectAttempts++;
+        
+        if (this.reconnectAttempts <= this.maxReconnectAttempts) {
+            setTimeout(() => {
+                if (!this.isConnected) {
+                    this.attemptReconnection();
+                }
+            }, 2000 * this.reconnectAttempts);
         }
         
-        const unsubscribe = auth.onAuthStateChanged((user) => {
-            unsubscribe();
-            
-            if (user) {
-                console.log("✅ User authenticated via Firebase:", user.email);
-                localStorage.setItem('solar_user_logged_in', 'true');
-                localStorage.setItem('solar_user_email', user.email);
-                localStorage.setItem('solar_user_uid', user.uid);
-                resolve(user);
-            } else {
-                console.log("❌ No authenticated user found");
-                reject(new Error("No authenticated user"));
-            }
-        });
+        console.warn(`❌ Firebase disconnected. Reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}`);
+    }
+    
+    attemptReconnection() {
+        if (this.isConnected) return;
         
-        setTimeout(() => {
-            unsubscribe();
-            reject(new Error("Auth check timeout"));
-        }, 5000);
-    });
+        this.updateConnectionUI(false, 'পুনঃসংযোগের চেষ্টা করা হচ্ছে...');
+        
+        if (firebase.database()) {
+            firebase.database().goOnline();
+        }
+    }
+    
+    updateConnectionUI(connected, message) {
+        const connectionDot = document.getElementById('connectionIndicator');
+        const cloudStatus = document.getElementById('cloud_status');
+        
+        if (!connectionDot || !cloudStatus) return;
+        
+        if (connected) {
+            connectionDot.className = 'connection-dot connected';
+            cloudStatus.textContent = message || 'Firebase সংযুক্ত';
+            cloudStatus.style.color = '#4CAF50';
+        } else {
+            connectionDot.className = 'connection-dot disconnected';
+            cloudStatus.textContent = message || 'Firebase সংযোগ বিচ্ছিন্ন';
+            cloudStatus.style.color = '#f44336';
+        }
+    }
+    
+    updateLastSyncTime() {
+        const lastSyncElement = document.getElementById('last_sync');
+        if (lastSyncElement) {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('bn-BD', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+            lastSyncElement.textContent = `সর্বশেষ: ${timeStr}`;
+        }
+    }
+    
+    updateSystemDateTime() {
+        const now = new Date();
+        
+        // Update time
+        const timeElement = document.getElementById('systemTime');
+        if (timeElement) {
+            const timeStr = now.toLocaleTimeString('bn-BD', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false
+            });
+            timeElement.textContent = timeStr;
+        }
+        
+        // Update date
+        const dateElement = document.getElementById('systemDate');
+        if (dateElement) {
+            const dateStr = now.toLocaleDateString('bn-BD', {
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric',
+                weekday: 'long'
+            });
+            dateElement.textContent = dateStr;
+        }
+    }
+    
+    checkConnectionHealth() {
+        if (!this.isConnected && this.lastConnectionTime) {
+            const now = new Date();
+            const disconnectDuration = (now - this.lastConnectionTime) / 1000;
+            
+            if (disconnectDuration > 60) {
+                console.warn(`⚠️ Firebase disconnected for ${Math.floor(disconnectDuration)} seconds`);
+                
+                const cloudStatus = document.getElementById('cloud_status');
+                if (cloudStatus) {
+                    cloudStatus.textContent = `সংযোগ বিচ্ছিন্ন (${Math.floor(disconnectDuration)}s)`;
+                }
+            }
+        }
+    }
+    
+    destroy() {
+        if (this.connectionRef) {
+            this.connectionRef.off();
+        }
+        
+        if (this.connectionCheckInterval) {
+            clearInterval(this.connectionCheckInterval);
+        }
+        
+        console.log('🔗 Firebase Connection Manager destroyed');
+    }
+    
+    getConnectionStatus() {
+        return {
+            isConnected: this.isConnected,
+            lastConnectionTime: this.lastConnectionTime,
+            reconnectAttempts: this.reconnectAttempts
+        };
+    }
+}
+
+function initializeFirebaseConnection() {
+    if (!firebaseConnectionManager) {
+        firebaseConnectionManager = new FirebaseConnectionManager();
+        
+        // Start system date/time updates
+        setInterval(() => {
+            firebaseConnectionManager.updateSystemDateTime();
+        }, 1000);
+        
+        // Initial update
+        firebaseConnectionManager.updateSystemDateTime();
+    }
+    return firebaseConnectionManager;
+}
+
+// ==================== ENERGY CALCULATION ====================
+
+function startEnergyCalculation() {
+    console.log("🔋 Starting energy calculation...");
+    
+    // Load saved energy from Firebase
+    loadSavedEnergy();
+    
+    // Start periodic energy calculation
+    setInterval(() => {
+        calculateEnergy();
+    }, ENERGY_UPDATE_INTERVAL);
+}
+
+function loadSavedEnergy() {
+    if (!database || !isConnected) {
+        console.error("❌ Database not connected for loading energy");
+        return;
+    }
+    
+    console.log("📥 Loading saved energy from Firebase...");
+    
+    const energyRef = database.ref('solar_system/energy_data/total_energy_wh');
+    
+    energyRef.once("value")
+        .then((snapshot) => {
+            const savedEnergy = snapshot.val();
+            if (savedEnergy !== null && savedEnergy !== undefined) {
+                totalEnergyWh = parseFloat(savedEnergy) || 0;
+                console.log("✅ Loaded saved energy:", totalEnergyWh.toFixed(2), "Wh");
+                updateTotalEnergyDisplay();
+            } else {
+                console.log("⚠️ No saved energy found, starting from 0");
+                totalEnergyWh = 0;
+                updateTotalEnergyDisplay();
+            }
+        })
+        .catch(error => {
+            console.error("❌ Error loading saved energy:", error);
+            totalEnergyWh = 0;
+            updateTotalEnergyDisplay();
+        });
+}
+
+function calculateEnergy() {
+    const now = Date.now();
+    
+    if (lastEnergyUpdateTime === 0) {
+        lastEnergyUpdateTime = now;
+        return;
+    }
+    
+    const timeDiffHours = (now - lastEnergyUpdateTime) / (1000 * 3600);
+    
+    // Calculate solar power in watts
+    const solarPowerW = currentSolarVoltage * solarCurrent;
+    
+    // Calculate energy generated
+    const energyGeneratedWh = solarPowerW * timeDiffHours;
+    
+    if (energyGeneratedWh > 0) {
+        totalEnergyWh += energyGeneratedWh;
+        
+        updateTotalEnergyDisplay();
+        
+        // Save to Firebase every 1 minute
+        if (now - lastEnergyUpdateTime > 60000) {
+            saveEnergyToFirebase();
+        }
+    }
+    
+    lastEnergyUpdateTime = now;
+}
+
+function updateTotalEnergyDisplay() {
+    // Update total energy in dashboard
+    const totalEnergyElement = document.getElementById('total_energy');
+    if (totalEnergyElement) {
+        totalEnergyElement.textContent = totalEnergyWh.toFixed(2);
+        
+        // Add unit if not present
+        if (!totalEnergyElement.querySelector('.unit')) {
+            const unit = document.createElement('span');
+            unit.className = 'unit';
+            unit.textContent = ' Wh';
+            totalEnergyElement.appendChild(unit);
+        }
+    }
+    
+    // Update energy in power parameters section
+    const powerParamsEnergy = document.querySelector('.solar-group .parameter-item.full-width .param-value');
+    if (powerParamsEnergy) {
+        powerParamsEnergy.textContent = totalEnergyWh.toFixed(2);
+        if (!powerParamsEnergy.querySelector('.unit')) {
+            const unit = document.createElement('span');
+            unit.className = 'unit';
+            unit.textContent = ' Wh';
+            powerParamsEnergy.appendChild(unit);
+        }
+    }
+    
+    // Update energy in stats panel
+    const statsEnergy = document.querySelector('.stat-card .stat-value');
+    if (statsEnergy && statsEnergy.id === 'total_energy_stat') {
+        statsEnergy.textContent = totalEnergyWh.toFixed(2);
+    }
+    
+    console.log("🔋 Energy updated:", totalEnergyWh.toFixed(2), "Wh");
+}
+
+function saveEnergyToFirebase() {
+    if (!database || !isConnected) {
+        console.error("❌ Database not connected for saving energy");
+        return;
+    }
+    
+    const energyData = {
+        total_energy_wh: totalEnergyWh,
+        last_updated: Date.now(),
+        solar_voltage_at_save: currentSolarVoltage,
+        solar_current_at_save: solarCurrent,
+        calculated_power: (currentSolarVoltage * solarCurrent).toFixed(2)
+    };
+    
+    const energyRef = database.ref('solar_system/energy_data');
+    
+    energyRef.set(energyData)
+        .then(() => {
+            console.log("✅ Energy saved to Firebase:", totalEnergyWh.toFixed(2), "Wh");
+        })
+        .catch(error => {
+            console.error("❌ Error saving energy to Firebase:", error);
+        });
 }
 
 // ==================== DATABASE CONNECTION ====================
 
-function initDatabaseCompat() {
+function initDatabaseConnection() {
     if (!database) {
         console.error("❌ Database not available");
         showNotification("ডাটাবেস লোড হয়নি", "error");
         return;
     }
     
-    console.log("📡 Setting up database connection...");
+    console.log("📡 Setting up Firebase database connection...");
     
     const connectedRef = database.ref(".info/connected");
     
-    connectedRef.on("value", (snap) => {
+    connectedRef.on("value", function(snap) {
         const wasConnected = isConnected;
         isConnected = (snap.val() === true);
         
         console.log(`📊 Firebase Connection: ${isConnected ? '✅ CONNECTED' : '❌ DISCONNECTED'}`);
+        updateConnectionUI(isConnected);
         
         if (isConnected && !wasConnected) {
             console.log("✅ Firebase Database Connected");
             showNotification("Firebase সংযোগ সফল", "success");
-            updateConnectionUI(true);
             
-            // Setup real-time listeners
-            setupRealtimeListenersCompat();
-            
-            // Get initial data immediately
+            setupRealtimeListeners();
             fetchInitialData();
             
         } else if (!isConnected && wasConnected) {
             console.log("❌ Firebase Database Disconnected");
             showNotification("Firebase সংযোগ বিচ্ছিন্ন", "warning");
-            updateConnectionUI(false);
             stopAllIntervals();
         }
-    }, (error) => {
-        console.error("Connection monitoring error:", error);
     });
 }
 
@@ -245,7 +592,9 @@ function fetchInitialData() {
     console.log("📥 Fetching initial data from Firebase...");
     
     // Fetch current data
-    database.ref('solar_system/current_data').once("value")
+    const currentDataRef = database.ref('solar_system/current_data');
+    
+    currentDataRef.once("value")
         .then((snapshot) => {
             const data = snapshot.val();
             if (data) {
@@ -253,8 +602,18 @@ function fetchInitialData() {
                 updateSensorValuesFromFirebase(data);
                 updateDashboard(data);
                 lastValidDataTime = Date.now();
+                
+                if (powerMode === 'auto') {
+                    console.log("🔄 Auto mode - checking conditions with fresh data");
+                    checkAutoPowerConditions();
+                }
             } else {
                 console.log("⚠️ No initial data found");
+                
+                if (powerMode === 'auto') {
+                    console.log("⚠️ Auto mode: No initial data, switching to grid");
+                    executePowerSwitch('grid', 'প্রাথমিক ডেটা না পাওয়ায় গ্রিডে সুইচ');
+                }
             }
         })
         .catch(error => {
@@ -262,7 +621,9 @@ function fetchInitialData() {
         });
     
     // Fetch system status
-    database.ref('solar_system/system_status').once("value")
+    const systemStatusRef = database.ref('solar_system/system_status');
+    
+    systemStatusRef.once("value")
         .then((snapshot) => {
             const status = snapshot.val();
             if (status) {
@@ -281,30 +642,44 @@ function fetchInitialData() {
                     activePowerSource = status.power_source;
                     lastPowerSource = status.power_source;
                     updatePowerFlow(activePowerSource);
-                    updateActivePowerSourceButton(activePowerSource);
+                    updatePowerButtonsUI();
                 }
             }
         })
         .catch(error => {
             console.error("❌ Status fetch error:", error);
         });
+    
+    // Fetch energy data
+    const energyRef = database.ref('solar_system/energy_data');
+    
+    energyRef.once("value")
+        .then((snapshot) => {
+            const energyData = snapshot.val();
+            if (energyData) {
+                console.log("✅ Energy data loaded:", energyData);
+                if (energyData.total_energy_wh) {
+                    totalEnergyWh = parseFloat(energyData.total_energy_wh);
+                    updateTotalEnergyDisplay();
+                }
+            }
+        })
+        .catch(error => {
+            console.error("❌ Energy data fetch error:", error);
+        });
 }
 
 // ==================== REALTIME LISTENERS ====================
 
-function setupRealtimeListenersCompat() {
+function setupRealtimeListeners() {
     if (!database) return;
     
     console.log("📡 Setting up Firebase listeners...");
     
     try {
-        // Clear any existing listeners
-        database.ref('solar_system/current_data').off();
-        database.ref('solar_system/system_status').off();
-        database.ref('solar_system/commands').off();
-        
         // Current data listener
         const currentDataRef = database.ref('solar_system/current_data');
+        
         currentDataRef.on("value", (snapshot) => {
             const data = snapshot.val();
             if (data) {
@@ -313,16 +688,19 @@ function setupRealtimeListenersCompat() {
                 esp32Connected = true;
                 updateESP32Status(true);
                 
-                // Update sensor values
                 updateSensorValuesFromFirebase(data);
-                
-                // Update dashboard UI
                 updateDashboard(data);
                 
-                // Check auto mode conditions
+                // Update solar priority indicator
+                updateSolarPriorityIndicator();
+                
                 if (powerMode === 'auto') {
-                    console.log("🔄 New data - Checking auto conditions...");
-                    checkAutoPowerConditions();
+                    const now = Date.now();
+                    if (!lastAutoCheckTime || now - lastAutoCheckTime >= 1000) {
+                        lastAutoCheckTime = now;
+                        console.log("🔄 Auto mode check (1s interval)...");
+                        checkAutoPowerConditions();
+                    }
                 }
             } else {
                 console.log("⚠️ No real-time data from Firebase");
@@ -330,27 +708,34 @@ function setupRealtimeListenersCompat() {
                     esp32Connected = false;
                     updateESP32Status(false);
                 }
+                
+                // Update solar priority indicator
+                updateSolarPriorityIndicator();
+                
+                if (powerMode === 'auto') {
+                    console.log("⚠️ Auto mode: No real-time data, switching to grid");
+                    if (activePowerSource !== 'grid') {
+                        executePowerSwitch('grid', 'রিয়েল-টাইম ডেটা না পাওয়ায় গ্রিডে সুইচ');
+                    }
+                }
             }
-        }, (error) => {
-            console.error("Current data listener error:", error);
         });
         
         // System status listener
         const systemStatusRef = database.ref('solar_system/system_status');
+        
         systemStatusRef.on("value", (snapshot) => {
             const status = snapshot.val();
             if (status) {
                 console.log("📊 System status updated:", status);
                 
-                // Update power source if changed
                 if (status.power_source && status.power_source !== activePowerSource) {
                     activePowerSource = status.power_source;
                     lastPowerSource = status.power_source;
                     updatePowerFlow(activePowerSource);
-                    updateActivePowerSourceButton(activePowerSource);
+                    updatePowerButtonsUI();
                 }
                 
-                // Update mode if changed
                 if (status.mode && status.mode !== powerMode) {
                     powerMode = status.mode;
                     updateModeUI(powerMode);
@@ -364,16 +749,46 @@ function setupRealtimeListenersCompat() {
             }
         });
         
-        // Commands listener (to detect emergency stop)
+        // Energy data listener
+        const energyRef = database.ref('solar_system/energy_data');
+        
+        energyRef.on("value", (snapshot) => {
+            const energyData = snapshot.val();
+            if (energyData && energyData.total_energy_wh) {
+                const newEnergy = parseFloat(energyData.total_energy_wh);
+                if (newEnergy !== totalEnergyWh) {
+                    totalEnergyWh = newEnergy;
+                    updateTotalEnergyDisplay();
+                    console.log("🔋 Energy updated from Firebase:", totalEnergyWh.toFixed(2), "Wh");
+                }
+            }
+        });
+        
+        // Commands listener
         const commandsRef = database.ref('solar_system/commands');
+        
         commandsRef.on("value", (snapshot) => {
             const command = snapshot.val();
             if (command && command.action === 'emergency_stop') {
                 console.log("⚠️ Emergency stop detected from Firebase");
-                // Update UI to reflect emergency stop
                 powerMode = 'stop';
                 updateModeUI('stop');
                 stopAllIntervals();
+            }
+            
+            if (command && command.action === 'reset_system') {
+                console.log("🔄 System reset detected from Firebase");
+                
+                setTimeout(() => {
+                    console.log("🔄 Refreshing data after reset...");
+                    fetchInitialData();
+                    
+                    if (powerMode === 'auto') {
+                        setTimeout(() => {
+                            forceDataFetchForAutoMode();
+                        }, 2000);
+                    }
+                }, 1000);
             }
         });
         
@@ -388,396 +803,21 @@ function setupRealtimeListenersCompat() {
     startDataValidityCheck();
 }
 
-// ==================== INTERVAL MANAGEMENT ====================
-
-function stopAllIntervals() {
-    console.log("🛑 Stopping all intervals...");
-    
-    if (autoPowerInterval) {
-        clearInterval(autoPowerInterval);
-        autoPowerInterval = null;
-        console.log("✅ Auto power interval stopped");
-    }
-    
-    if (autoCheckInterval) {
-        clearInterval(autoCheckInterval);
-        autoCheckInterval = null;
-        console.log("✅ Auto check interval stopped");
-    }
-}
-
-// ==================== DATA VALIDITY CHECK ====================
-
-function startDataValidityCheck() {
-    // Clear existing interval
-    if (autoCheckInterval) {
-        clearInterval(autoCheckInterval);
-    }
-    
-    autoCheckInterval = setInterval(() => {
-        const now = Date.now();
-        const timeSinceValidData = now - lastValidDataTime;
-        
-        if (timeSinceValidData > AUTO_THRESHOLDS.DATA_TIMEOUT) {
-            console.log("⚠️ No valid data for", Math.floor(timeSinceValidData/1000), "seconds");
-            
-            if (powerMode === 'auto') {
-                console.log("🔌 Auto mode: Switching to grid due to no data");
-                if (activePowerSource !== 'grid') {
-                    executePowerSwitch('grid', 'ডেটা না পাওয়ায় গ্রিডে সুইচ');
-                }
-            }
-        }
-    }, 10000);
-    
-    console.log("✅ Data validity check started");
-}
-
-// ==================== UPDATE SENSOR VALUES FROM FIREBASE ====================
-
-function updateSensorValuesFromFirebase(data) {
-    // Update from Firebase data only
-    currentSolarVoltage = parseFloat(data.solar_voltage) || 0;
-    currentBatteryVoltage = parseFloat(data.battery_voltage) || 0;
-    currentBatterySOC = parseFloat(data.battery_soc) || 0;
-    solarCurrent = parseFloat(data.solar_current) || 0;
-    batteryCurrent = parseFloat(data.battery_current) || 0;
-    loadCurrent = parseFloat(data.load_current) || 0;
-    
-    console.log(`📊 Firebase Data Update:`);
-    console.log(`   Solar: ${currentSolarVoltage.toFixed(2)}V, ${solarCurrent.toFixed(2)}A`);
-    console.log(`   Battery: ${currentBatteryVoltage.toFixed(2)}V, ${batteryCurrent.toFixed(2)}A, SOC: ${currentBatterySOC.toFixed(1)}%`);
-    console.log(`   Load: ${loadCurrent.toFixed(2)}A`);
-    
-    // Update voltage display
-    const solarVElement = document.querySelector('.solar_v .value');
-    const batteryVElement = document.querySelector('.battery_v .value');
-    
-    if (solarVElement) solarVElement.textContent = currentSolarVoltage.toFixed(2);
-    if (batteryVElement) batteryVElement.textContent = currentBatteryVoltage.toFixed(2);
-}
-
-// ==================== AUTO POWER SWITCHING ====================
-
-function startAutoPowerSwitching() {
-    console.log("🔋 Auto power switching starting...");
-    
-    // Stop any existing auto mode
-    stopAutoPowerSwitching();
-    
-    // Set mode to auto
-    powerMode = 'auto';
-    updateModeUI('auto');
-    updateActivePowerSourceButton('auto');
-    
-    // Update Firebase status
-    updateFirebaseStatus('auto', activePowerSource);
-    
-    // Start checking interval
-    autoPowerInterval = setInterval(() => {
-        if (powerMode === 'auto' && !isSwitchingInProgress) {
-            console.log("⏰ Auto mode scheduled check");
-            checkAutoPowerConditions();
-        }
-    }, 15000); // Check every 15 seconds
-    
-    // First check after 3 seconds
-    setTimeout(() => {
-        if (powerMode === 'auto') {
-            console.log("🚀 First auto mode check");
-            checkAutoPowerConditions();
-        }
-    }, 3000);
-    
-    console.log("✅ Auto power switching started");
-    showNotification("অটো মোড চালু হয়েছে", "success");
-}
-
-function stopAutoPowerSwitching() {
-    if (autoPowerInterval) {
-        clearInterval(autoPowerInterval);
-        autoPowerInterval = null;
-        console.log("⏹️ Auto power switching stopped");
-    }
-}
-
-function checkAutoPowerConditions() {
-    // Check if we can proceed
-    if (powerMode !== 'auto') {
-        console.log("⚠️ Auto mode not active");
-        return;
-    }
-    
-    if (isSwitchingInProgress) {
-        console.log("⚠️ Switching already in progress");
-        return;
-    }
-    
-    const now = Date.now();
-    if (now - lastSwitchTime < MIN_SWITCH_INTERVAL) {
-        console.log("⏰ Too soon after last switch");
-        return;
-    }
-    
-    // Check Firebase connection
-    if (!database || !isConnected) {
-        console.error("❌ Firebase not connected");
-        showNotification("Firebase সংযোগ নেই", "warning");
-        return;
-    }
-    
-    // Check if we have valid data
-    if (currentSolarVoltage === 0 && currentBatteryVoltage === 0) {
-        console.log("⚠️ No valid sensor data");
-        
-        // Try to fetch fresh data
-        database.ref('solar_system/current_data').once("value")
-            .then((snapshot) => {
-                const freshData = snapshot.val();
-                if (freshData) {
-                    updateSensorValuesFromFirebase(freshData);
-                    // Retry after getting data
-                    setTimeout(checkAutoPowerConditions, 1000);
-                } else {
-                    console.log("❌ Still no data - switching to grid");
-                    executePowerSwitch('grid', 'ডেটা না পাওয়ায় গ্রিড');
-                }
-            });
-        return;
-    }
-    
-    console.log("=".repeat(60));
-    console.log("🔍 AUTO MODE: SMART POWER SWITCHING CHECK");
-    console.log("=".repeat(60));
-    
-    const solarVoltage = currentSolarVoltage;
-    const batteryVoltage = currentBatteryVoltage;
-    const batterySOC = currentBatterySOC;
-    const voltageDiff = solarVoltage - batteryVoltage;
-    
-    console.log(`📊 CURRENT VALUES:`);
-    console.log(`   Solar: ${solarVoltage.toFixed(2)}V (Current: ${solarCurrent.toFixed(2)}A)`);
-    console.log(`   Battery: ${batteryVoltage.toFixed(2)}V (SOC: ${batterySOC.toFixed(1)}%, Current: ${batteryCurrent.toFixed(2)}A)`);
-    console.log(`   Difference: ${voltageDiff.toFixed(2)}V`);
-    console.log(`   Current Source: ${lastPowerSource}`);
-    
-    // Decision making logic
-    let newPowerSource = null;
-    let reason = "";
-    
-    // 🚨 PRIORITY 1: EMERGENCY - Battery critically low
-    if (batterySOC > 0 && batterySOC < AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC) {
-        newPowerSource = 'grid';
-        reason = `ব্যাটারি SOC কম: ${batterySOC.toFixed(1)}% < ${AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC}%`;
-        console.log(`🚨 EMERGENCY: ${reason}`);
-    }
-    
-    // ☀️ PRIORITY 2: SOLAR - If solar is available and good enough
-    if (!newPowerSource && solarVoltage > 0) {
-        const solarGood = solarVoltage >= AUTO_THRESHOLDS.SOLAR_MIN_VOLTAGE;
-        const solarBetterThanBattery = voltageDiff >= AUTO_THRESHOLDS.SOLAR_BATTERY_DIFF;
-        const solarGoodForGridSwitch = solarVoltage >= AUTO_THRESHOLDS.MIN_SOLAR_VOLTAGE_FOR_SWITCH;
-        const solarMuchBetter = voltageDiff >= AUTO_THRESHOLDS.GRID_TO_SOLAR_THRESHOLD;
-        const batteryLow = batterySOC < AUTO_THRESHOLDS.BATTERY_LOW_SOC;
-        
-        // Check current source
-        const currentlyOnGrid = lastPowerSource === 'grid';
-        const currentlyOnSolar = lastPowerSource === 'solar';
-        const currentlyOnBattery = lastPowerSource === 'battery';
-        
-        // If currently on grid, only switch to solar if it's VERY good
-        if (currentlyOnGrid) {
-            if (solarGood && solarGoodForGridSwitch && solarMuchBetter) {
-                newPowerSource = 'solar';
-                reason = `সোলার খুব ভালো: ${solarVoltage.toFixed(2)}V (ব্যাটারি থেকে ${voltageDiff.toFixed(2)}V বেশি)`;
-                console.log(`☀️ GRID → SOLAR: ${reason}`);
-            } else {
-                console.log(`⏸️ Staying on GRID (solar not good enough):`);
-                console.log(`   Solar: ${solarVoltage.toFixed(2)}V, Need: ${AUTO_THRESHOLDS.MIN_SOLAR_VOLTAGE_FOR_SWITCH}V for switch`);
-                console.log(`   Diff: ${voltageDiff.toFixed(2)}V, Need: ${AUTO_THRESHOLDS.GRID_TO_SOLAR_THRESHOLD}V for switch`);
-            }
-        }
-        // If currently on solar, stay if still good
-        else if (currentlyOnSolar) {
-            const solarStillGood = solarVoltage >= (AUTO_THRESHOLDS.SOLAR_MIN_VOLTAGE - 0.5);
-            const solarPowerGood = solarCurrent > 0.1; // Some current is flowing
-            
-            if (solarStillGood && solarPowerGood) {
-                console.log(`✅ Staying on SOLAR:`);
-                console.log(`   Voltage: ${solarVoltage.toFixed(2)}V, Current: ${solarCurrent.toFixed(2)}A`);
-                // Stay on solar, no switch
-            } else if (solarVoltage < AUTO_THRESHOLDS.SOLAR_TO_GRID_THRESHOLD) {
-                // Solar too low, switch to battery or grid
-                if (batteryVoltage >= AUTO_THRESHOLDS.BATTERY_MIN_VOLTAGE && batterySOC > AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC) {
-                    newPowerSource = 'battery';
-                    reason = `সোলার কম: ${solarVoltage.toFixed(2)}V, ব্যাটারি ভালো: ${batteryVoltage.toFixed(2)}V`;
-                    console.log(`🔋 SOLAR → BATTERY: ${reason}`);
-                } else {
-                    newPowerSource = 'grid';
-                    reason = `সোলার কম: ${solarVoltage.toFixed(2)}V, ব্যাটারি অপর্যাপ্ত`;
-                    console.log(`🔌 SOLAR → GRID: ${reason}`);
-                }
-            }
-        }
-        // If currently on battery, switch to solar if better
-        else if (currentlyOnBattery) {
-            if (solarGood && solarBetterThanBattery) {
-                newPowerSource = 'solar';
-                reason = `সোলার ভালো: ${solarVoltage.toFixed(2)}V (ব্যাটারি থেকে ${voltageDiff.toFixed(2)}V বেশি)`;
-                console.log(`☀️ BATTERY → SOLAR: ${reason}`);
-            } else if (batteryLow && solarGood) {
-                newPowerSource = 'solar';
-                reason = `ব্যাটারি কম: ${batterySOC.toFixed(1)}%, সোলার ব্যবহার`;
-                console.log(`☀️ BATTERY → SOLAR (low battery): ${reason}`);
-            }
-        }
-        // If no current source or starting up
-        else {
-            if (solarGood && solarBetterThanBattery) {
-                newPowerSource = 'solar';
-                reason = `সোলার ভালো: ${solarVoltage.toFixed(2)}V`;
-                console.log(`☀️ START → SOLAR: ${reason}`);
-            }
-        }
-    }
-    
-    // 🔋 PRIORITY 3: BATTERY - If battery is good and solar is insufficient
-    if (!newPowerSource && batteryVoltage > 0) {
-        const batteryGood = batteryVoltage >= AUTO_THRESHOLDS.BATTERY_MIN_VOLTAGE;
-        const batterySOCGood = batterySOC > AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC;
-        const solarInsufficient = solarVoltage < AUTO_THRESHOLDS.SOLAR_MIN_VOLTAGE;
-        
-        const currentlyOnGrid = lastPowerSource === 'grid';
-        const currentlyOnSolar = lastPowerSource === 'solar';
-        
-        if (batteryGood && batterySOCGood) {
-            // If on grid and solar is insufficient, switch to battery
-            if (currentlyOnGrid && solarInsufficient) {
-                newPowerSource = 'battery';
-                reason = `সোলার অপর্যাপ্ত: ${solarVoltage.toFixed(2)}V, ব্যাটারি ভালো: ${batteryVoltage.toFixed(2)}V`;
-                console.log(`🔋 GRID → BATTERY: ${reason}`);
-            }
-            // If on solar and solar became insufficient, switch to battery
-            else if (currentlyOnSolar && solarInsufficient) {
-                newPowerSource = 'battery';
-                reason = `সোলার কমে গেছে: ${solarVoltage.toFixed(2)}V, ব্যাটারি ব্যবহার`;
-                console.log(`🔋 SOLAR → BATTERY: ${reason}`);
-            }
-        }
-    }
-    
-    // 🔌 PRIORITY 4: GRID - Fallback only if solar and battery both insufficient
-    if (!newPowerSource) {
-        const solarBad = solarVoltage < AUTO_THRESHOLDS.SOLAR_MIN_VOLTAGE;
-        const batteryBad = batteryVoltage < AUTO_THRESHOLDS.BATTERY_MIN_VOLTAGE;
-        const batterySOCBad = batterySOC <= AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC;
-        
-        const currentlyOnGrid = lastPowerSource === 'grid';
-        
-        // Only switch to grid if both solar and battery are bad AND we're not already on grid
-        if (!currentlyOnGrid && solarBad && (batteryBad || batterySOCBad)) {
-            newPowerSource = 'grid';
-            reason = `সোলার অপর্যাপ্ত: ${solarVoltage.toFixed(2)}V, ব্যাটারি ${batterySOCBad ? 'SOC কম' : 'ভোল্টেজ কম'}`;
-            console.log(`🔌 SWITCH TO GRID: ${reason}`);
-        } else if (currentlyOnGrid && (solarBad || batteryBad || batterySOCBad)) {
-            // Already on grid and conditions are bad, stay on grid
-            console.log(`✅ Staying on GRID: Conditions not good for switch`);
-            console.log(`   Solar: ${solarVoltage.toFixed(2)}V, Battery: ${batteryVoltage.toFixed(2)}V, SOC: ${batterySOC.toFixed(1)}%`);
-        } else {
-            // Keep current source if it's still working
-            console.log(`✅ NO SWITCH NEEDED: Current source (${lastPowerSource}) still viable`);
-            console.log(`   Solar: ${solarVoltage.toFixed(2)}V, Battery: ${batteryVoltage.toFixed(2)}V, SOC: ${batterySOC.toFixed(1)}%`);
-            console.log("=".repeat(60));
-            return;
-        }
-    }
-    
-    // Check if switching is needed
-    if (newPowerSource && newPowerSource !== lastPowerSource) {
-        console.log(`🔄 DECISION: ${lastPowerSource} → ${newPowerSource}`);
-        console.log(`📝 REASON: ${reason}`);
-        
-        // Apply hysteresis to prevent rapid switching
-        if (lastPowerSource === 'solar' && newPowerSource === 'battery') {
-            const hysteresisThreshold = -AUTO_THRESHOLDS.SOLAR_BATTERY_DIFF - AUTO_THRESHOLDS.HYSTERESIS;
-            if (voltageDiff > hysteresisThreshold) {
-                console.log(`⏸️ HYSTERESIS: Staying on solar (diff: ${voltageDiff.toFixed(2)}V)`);
-                console.log("=".repeat(60));
-                return;
-            }
-        }
-        
-        // Don't switch from solar to grid unnecessarily
-        if (lastPowerSource === 'solar' && newPowerSource === 'grid') {
-            // Only switch from solar to grid if solar is very bad
-            const solarVeryBad = solarVoltage < AUTO_THRESHOLDS.SOLAR_TO_GRID_THRESHOLD;
-            if (!solarVeryBad) {
-                console.log(`⏸️ Staying on SOLAR: Not bad enough for grid (${solarVoltage.toFixed(2)}V)`);
-                console.log("=".repeat(60));
-                return;
-            }
-        }
-        
-        // Execute the switch
-        executePowerSwitch(newPowerSource, reason);
-        
-    } else if (activePowerSource === 'off') {
-        console.log("⚠️ System is off");
-    } else {
-        console.log(`✅ NO SWITCH NEEDED: Already on optimal source (${lastPowerSource})`);
-    }
-    
-    console.log("=".repeat(60));
-}
-
-function executePowerSwitch(targetSource, reason) {
-    if (isSwitchingInProgress) return;
-    
-    console.log(`⚡ Executing switch: ${lastPowerSource} → ${targetSource}`);
-    isSwitchingInProgress = true;
-    lastSwitchTime = Date.now();
-    
-    // Update UI immediately
-    updatePowerFlow(targetSource);
-    updateActivePowerSourceButton(targetSource);
-    
-    // Add delay for smooth switching
-    setTimeout(() => {
-        if (targetSource === 'solar') {
-            switchToSolarPower(reason);
-        } else if (targetSource === 'battery') {
-            switchToBatteryPower(reason);
-        } else if (targetSource === 'grid') {
-            switchToGridPower(reason);
-        }
-        
-        isSwitchingInProgress = false;
-    }, 1500);
-}
-
-// ==================== SWITCH FUNCTIONS ====================
-
-function switchToSolarPower(reason) {
-    console.log("☀️ Switching to SOLAR");
-    controlPowerSource('solar', 'on', reason);
-}
-
-function switchToBatteryPower(reason) {
-    console.log("🔋 Switching to BATTERY");
-    controlPowerSource('battery', 'on', reason);
-}
-
-function switchToGridPower(reason) {
-    console.log("🔌 Switching to GRID");
-    controlPowerSource('grid', 'on', reason);
-}
-
-// ==================== CONTROL PANEL ====================
+// ==================== CONTROL PANEL INITIALIZATION ====================
 
 function initControlPanel() {
     console.log("🔄 Initializing control panel...");
     
-    // ================= MODE BUTTONS =================
+    setupModeButtons();
+    setupPowerButtons();
+    setupBrushButtons();
+    setupPumpButtons();
+    setupCleaningButtons();
+    
+    console.log("✅ Control panel initialized");
+}
+
+function setupModeButtons() {
     const autoModeBtn = document.getElementById('autoModeBtn');
     const manualModeBtn = document.getElementById('manualModeBtn');
     const stopModeBtn = document.getElementById('stopModeBtn');
@@ -789,9 +829,16 @@ function initControlPanel() {
             console.log("Auto Mode button clicked");
             
             if (powerMode !== 'auto') {
-                // Switch to AUTO mode
-                switchToMode('auto');
+                if (powerMode === 'stop') {
+                    if (confirm('ইমারজেন্সি স্টপ থেকে সিস্টেম রিসেট করতে চান?')) {
+                        resetFromEmergencyStop('auto');
+                    }
+                } else {
+                    switchToMode('auto');
+                }
             }
+            
+            updateModeButtons();
         });
     }
     
@@ -802,9 +849,16 @@ function initControlPanel() {
             console.log("Manual Mode button clicked");
             
             if (powerMode !== 'manual') {
-                // Switch to MANUAL mode
-                switchToMode('manual');
+                if (powerMode === 'stop') {
+                    if (confirm('ইমারজেন্সি স্টপ থেকে সিস্টেম রিসেট করতে চান?')) {
+                        resetFromEmergencyStop('manual');
+                    }
+                } else {
+                    switchToMode('manual');
+                }
             }
+            
+            updateModeButtons();
         });
     }
     
@@ -815,164 +869,95 @@ function initControlPanel() {
             console.log("Stop Mode button clicked");
             
             if (powerMode !== 'stop') {
-                // Switch to STOP mode
-                switchToMode('stop');
+                if (confirm('সিস্টেম জরুরি বন্ধ করতে চান?')) {
+                    emergencyStop();
+                }
             }
+            
+            updateModeButtons();
         });
     }
-    
-    // ================= সার্ভো কন্ট্রোল বাটন =================
-    // ================= সার্ভো কন্ট্রোল বাটন =================
-const servoControlBtns = document.querySelectorAll('.servo-control-btn');
-servoControlBtns.forEach(btn => {
-    btn.addEventListener('click', function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        const direction = this.getAttribute('data-direction');
-        const angle = this.getAttribute('data-angle') || 5;
-        console.log("Servo control clicked:", direction, angle);
-        
-        // আগের সব active ক্লাস রিমুভ করুন
-        servoControlBtns.forEach(b => b.classList.remove('active'));
-        
-        // বর্তমান বাটনে active ক্লাস যোগ করুন
-        this.classList.add('active');
-        
-        // ২ সেকেন্ড পর active ক্লাস রিমুভ করুন
-        setTimeout(() => {
-            this.classList.remove('active');
-        }, 2000);
-        
-        // সার্ভো কমান্ড পাঠান
-        sendServoCommand(direction, parseInt(angle));
-        
-        // নোটিফিকেশন দেখান
-        showNotification(`সার্ভো ${getDirectionText(direction)} দিকে ${angle}° ঘোরানো হয়েছে`, 'info');
-    });
-});
-
-// দিকের বাংলা নাম ফাংশন
-function getDirectionText(direction) {
-    const directions = {
-        'up': 'উপরের',
-        'down': 'নিচের',
-        'left': 'বাম',
-        'right': 'ডান',
-        'center': 'সেন্টার'
-    };
-    return directions[direction] || direction;
-}
-    
-    // ==================== SERVO VISUAL FEEDBACK ====================
-
-function activateServoButton(button) {
-    // Remove active class from all servo buttons
-    document.querySelectorAll('.servo-control-btn').forEach(btn => {
-        btn.classList.remove('active');
-    });
-    
-    // Add active class to clicked button
-    button.classList.add('active');
-    
-    // Add icon animation
-    const icon = button.querySelector('i');
-    if (icon) {
-        icon.style.transform = 'scale(1.3)';
-        setTimeout(() => {
-            icon.style.transform = 'scale(1)';
-        }, 300);
-    }
-    
-    // Auto remove after 2 seconds
-    setTimeout(() => {
-        button.classList.remove('active');
-    }, 2000);
 }
 
-// Test function for servo buttons
-window.testServoVisual = function() {
-    console.log("🧪 Testing servo button visual feedback...");
+function setupPowerButtons() {
+    const powerSourceBtns = document.querySelectorAll('.power-source-btn');
     
-    const servoButtons = document.querySelectorAll('.servo-control-btn');
-    if (servoButtons.length === 0) {
-        console.log("❌ No servo buttons found");
+    powerSourceBtns.forEach(btn => {
+        btn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            
+            const source = this.getAttribute('data-source');
+            const state = this.getAttribute('data-state');
+            
+            console.log(`Power source button clicked: ${source}, state: ${state}`);
+            
+            handlePowerButtonClick(source, state);
+            updatePowerButtonsUI();
+        });
+    });
+}
+
+function handlePowerButtonClick(source, state) {
+    if (powerMode === 'stop') {
+        if (source === 'auto') {
+            if (confirm('ইমারজেন্সি স্টপ থেকে সিস্টেম রিসেট করতে চান?')) {
+                resetFromEmergencyStop('auto');
+            }
+        } else if (source === 'solar' || source === 'battery' || source === 'grid') {
+            if (confirm('ইমারজেন্সি স্টপ থেকে সিস্টেম রিসেট করতে চান?')) {
+                resetFromEmergencyStop('manual', source);
+            }
+        } else if (source === 'all' && state === 'off') {
+            if (confirm('ইমারজেন্সি স্টপ থেকে ম্যানুয়াল স্টপ করতে চান?')) {
+                resetFromEmergencyStop('manual', 'off');
+            }
+        }
         return;
     }
     
-    // Test each button with delay
-    servoButtons.forEach((btn, index) => {
-        setTimeout(() => {
-            const direction = btn.getAttribute('data-direction');
-            console.log(`Testing: ${direction} button`);
-            activateServoButton(btn);
-        }, index * 1000);
-    });
+    if (source === 'all' && state === 'off') {
+        manualStop();
+        showNotification('সব OFF করা হয়েছে', 'warning');
+        return;
+    }
     
-    console.log("✅ Servo visual test started");
-};
+    if (source === 'stop') {
+        if (confirm('সিস্টেম জরুরি বন্ধ করতে চান?')) {
+            emergencyStop();
+        }
+        return;
+    }
     
-    
-    
-    
-    
-// ================= পাওয়ার সোর্স বাটন =================
-const powerSourceBtns = document.querySelectorAll('.power-source-btn');
-powerSourceBtns.forEach(btn => {
-    btn.addEventListener('click', function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        const source = this.getAttribute('data-source');
-        const state = this.getAttribute('data-state');
-        
-        console.log(`Power source button clicked: ${source}, state: ${state}`);
-        
-        if (powerMode === 'stop') {
-            showNotification('সিস্টেম জরুরি বন্ধ আছে', 'warning');
-            return;
+    if (source === 'solar' || source === 'battery' || source === 'grid') {
+        if (powerMode !== 'manual') {
+            powerMode = 'manual';
+            updateModeUI('manual');
+            stopAutoPowerSwitching();
         }
         
-        // আগের সব active ক্লাস রিমুভ করুন
-        powerSourceBtns.forEach(b => {
-            b.classList.remove('active', 'manual-active');
-        });
+        controlPowerSource(source, state, 'ম্যানুয়াল সিলেকশন');
         
-        // বর্তমান বাটনে manual-active ক্লাস যোগ করুন
-        this.classList.add('manual-active');
-        
-        if (source === 'all' && state === 'off') {
-            // "সব OFF" বাটন → ম্যানুয়াল স্টপ
-            manualStop();
-            showNotification('সব OFF করা হয়েছে', 'warning');
-            return;
-        }
-        
-        if (source === 'solar' || source === 'battery' || source === 'grid') {
-            // Switch to MANUAL mode if not already
-            if (powerMode !== 'manual') {
-                switchToMode('manual');
-            }
-            
-            // Send command for the selected source
-            controlPowerSource(source, state, 'ম্যানুয়াল সিলেকশন');
-            
-            const sourceNames = {
-                'solar': 'সোলার',
-                'battery': 'ব্যাটারি',
-                'grid': 'গ্রিড'
-            };
-            showNotification(`${sourceNames[source]} চালু করা হয়েছে`, 'info');
-        }
-    });
-});
-    // ================= ব্রাশ কন্ট্রোল =================
-    // ব্রাশ মোড সিলেকশন
+        const sourceNames = {
+            'solar': 'সোলার',
+            'battery': 'ব্যাটারি',
+            'grid': 'গ্রিড'
+        };
+        showNotification(`${sourceNames[source]} চালু করা হয়েছে (ম্যানুয়াল)`, 'info');
+    }
+    
+    if (source === 'auto') {
+        switchToMode('auto');
+    }
+}
+
+function setupBrushButtons() {
     const brushAutoBtn = document.getElementById('brushAutoModeBtn');
     const brushManualBtn = document.getElementById('brushManualModeBtn');
     const manualBrushControl = document.getElementById('manualBrushControl');
     const autoBrushControl = document.getElementById('autoBrushControl');
     
     if (brushAutoBtn && brushManualBtn) {
-        // Set initial state
         if (currentBrushMode === 'auto') {
             brushAutoBtn.classList.add('active');
             brushManualBtn.classList.remove('active');
@@ -990,10 +975,15 @@ powerSourceBtns.forEach(btn => {
             e.stopPropagation();
             console.log("Brush Auto Mode clicked");
             currentBrushMode = 'auto';
+            
             brushAutoBtn.classList.add('active');
             brushManualBtn.classList.remove('active');
             if (manualBrushControl) manualBrushControl.style.display = 'none';
             if (autoBrushControl) autoBrushControl.style.display = 'block';
+            
+            sendBrushCommand('auto_mode');
+            updateBrushButtons();
+            
             showNotification('অটো ব্রাশ মোড সিলেক্ট করা হয়েছে', 'info');
         });
         
@@ -1002,21 +992,23 @@ powerSourceBtns.forEach(btn => {
             e.stopPropagation();
             console.log("Brush Manual Mode clicked");
             currentBrushMode = 'manual';
+            
             brushManualBtn.classList.add('active');
             brushAutoBtn.classList.remove('active');
             if (manualBrushControl) manualBrushControl.style.display = 'block';
             if (autoBrushControl) autoBrushControl.style.display = 'none';
+            
+            sendBrushCommand('manual_mode');
+            updateBrushButtons();
+            
             showNotification('ম্যানুয়াল ব্রাশ মোড সিলেক্ট করা হয়েছে', 'info');
         });
     }
     
-    // ম্যানুয়াল ব্রাশ কন্ট্রোল
     const brushForwardBtn = document.getElementById('brushForwardBtn');
     const brushReverseBtn = document.getElementById('brushReverseBtn');
     const brushStopBtn = document.getElementById('brushPumpStopBtn');
     const pumpOnBtn = document.getElementById('pumpOnBtn');
-    const startCleaningBtn = document.getElementById('startCleaningBtn');
-    const stopCleaningBtn = document.getElementById('stopCleaningBtn');
     const pumpOffBtn = document.getElementById('pumpOffBtn');
     
     if (brushForwardBtn) {
@@ -1024,9 +1016,13 @@ powerSourceBtns.forEach(btn => {
             e.preventDefault();
             e.stopPropagation();
             console.log("Brush Forward clicked");
+            
+            currentBrushMode = 'manual';
             brushStatus = 'forward';
-            updateBrushStatus();
+            
+            updateBrushButtons();
             sendBrushCommand('forward');
+            
             showNotification('ব্রাশ ফরওয়ার্ড চালু করা হয়েছে', 'info');
         });
     }
@@ -1036,9 +1032,13 @@ powerSourceBtns.forEach(btn => {
             e.preventDefault();
             e.stopPropagation();
             console.log("Brush Reverse clicked");
+            
+            currentBrushMode = 'manual';
             brushStatus = 'reverse';
-            updateBrushStatus();
+            
+            updateBrushButtons();
             sendBrushCommand('reverse');
+            
             showNotification('ব্রাশ রিভার্স চালু করা হয়েছে', 'info');
         });
     }
@@ -1048,12 +1048,15 @@ powerSourceBtns.forEach(btn => {
             e.preventDefault();
             e.stopPropagation();
             console.log("Brush Stop clicked");
+            
             brushStatus = 'stopped';
             pumpStatus = 'off';
-            updateBrushStatus();
-            updatePumpStatus();
+            
+            updateBrushButtons();
+            updatePumpButtons();
             sendBrushCommand('stop');
             sendPumpCommand('off');
+            
             showNotification('ব্রাশ ও পাম্প বন্ধ করা হয়েছে', 'warning');
         });
     }
@@ -1063,25 +1066,33 @@ powerSourceBtns.forEach(btn => {
             e.preventDefault();
             e.stopPropagation();
             console.log("Pump ON clicked");
+            
             pumpStatus = 'on';
-            updatePumpStatus();
+            updatePumpButtons();
             sendPumpCommand('on');
+            
             showNotification('পাম্প চালু করা হয়েছে', 'info');
         });
     }
     
-    // Check for pumpOffBtn (may not exist)
     if (pumpOffBtn) {
         pumpOffBtn.addEventListener('click', function(e) {
             e.preventDefault();
             e.stopPropagation();
             console.log("Pump OFF clicked");
+            
             pumpStatus = 'off';
-            updatePumpStatus();
+            updatePumpButtons();
             sendPumpCommand('off');
+            
             showNotification('পাম্প বন্ধ করা হয়েছে', 'warning');
         });
     }
+}
+
+function setupCleaningButtons() {
+    const startCleaningBtn = document.getElementById('startCleaningBtn');
+    const stopCleaningBtn = document.getElementById('stopCleaningBtn');
     
     if (startCleaningBtn) {
         startCleaningBtn.addEventListener('click', function(e) {
@@ -1090,6 +1101,14 @@ powerSourceBtns.forEach(btn => {
             console.log("Start Cleaning clicked");
             const duration = document.getElementById('cleaningDuration')?.value || 30;
             const interval = document.getElementById('cleaningInterval')?.value || 6;
+            
+            this.classList.add('active');
+            
+            setTimeout(() => {
+                this.classList.remove('active');
+                updateCleaningButtons();
+            }, 1000);
+            
             sendCleaningCommand('start', duration, interval);
             showNotification(`অটো পরিষ্কার শুরু: ${duration} সেকেন্ড, বিরতি: ${interval} ঘণ্টা`, 'info');
         });
@@ -1100,202 +1119,211 @@ powerSourceBtns.forEach(btn => {
             e.preventDefault();
             e.stopPropagation();
             console.log("Stop Cleaning clicked");
+            
+            this.classList.add('active');
+            
+            setTimeout(() => {
+                this.classList.remove('active');
+                updateCleaningButtons();
+            }, 1000);
+            
             sendCleaningCommand('stop');
             showNotification('অটো পরিষ্কার বন্ধ করা হয়েছে', 'warning');
         });
     }
-    
-    console.log("✅ Control panel initialized");
 }
 
-// ==================== MODE SWITCHING FUNCTIONS ====================
+// ==================== BUTTON STATE MANAGEMENT ====================
 
-function switchToMode(mode) {
-    console.log(`🔄 Switching to ${mode} mode`);
+function updateAllButtonStates() {
+    updateModeButtons();
+    updatePowerButtonsUI();
+    updateBrushButtons();
+    updatePumpButtons();
+    updateCleaningButtons();
+}
+
+function updateModeButtons() {
+    const autoBtn = document.getElementById('autoModeBtn');
+    const manualBtn = document.getElementById('manualModeBtn');
+    const stopBtn = document.getElementById('stopModeBtn');
     
-    // Handle mode switching
-    switch(mode) {
+    if (autoBtn) autoBtn.classList.remove('active');
+    if (manualBtn) manualBtn.classList.remove('active');
+    if (stopBtn) stopBtn.classList.remove('active');
+    
+    switch(powerMode) {
         case 'auto':
-            if (powerMode !== 'auto') {
-                powerMode = 'auto';
-                updateModeUI('auto');
-                updateActivePowerSourceButton('auto');
-                startAutoPowerSwitching();
-                showNotification('অটো মোড চালু হয়েছে', 'success');
-                updateFirebaseStatus('auto', activePowerSource);
-            }
+            if (autoBtn) autoBtn.classList.add('active');
+            buttonStates.mode.auto = true;
+            buttonStates.mode.manual = false;
+            buttonStates.mode.stop = false;
             break;
-            
         case 'manual':
-            if (powerMode !== 'manual') {
-                stopAutoPowerSwitching();
-                powerMode = 'manual';
-                updateModeUI('manual');
-                showNotification('ম্যানুয়াল মোড চালু হয়েছে', 'info');
-                updateFirebaseStatus('manual', activePowerSource);
-            }
+            if (manualBtn) manualBtn.classList.add('active');
+            buttonStates.mode.auto = false;
+            buttonStates.mode.manual = true;
+            buttonStates.mode.stop = false;
             break;
-            
         case 'stop':
-            if (powerMode !== 'stop') {
-                if (confirm('সিস্টেম জরুরি বন্ধ করতে চান?')) {
-                    emergencyStop();
-                }
-            }
+            if (stopBtn) stopBtn.classList.add('active');
+            buttonStates.mode.auto = false;
+            buttonStates.mode.manual = false;
+            buttonStates.mode.stop = true;
             break;
     }
 }
 
-// ==================== MANUAL STOP FUNCTION ====================
-
-function manualStop() {
-    console.log("⏹️ Manual Stop (রিলে বন্ধ)");
+function updatePowerButtonsUI() {
+    const powerButtons = document.querySelectorAll('.power-source-btn');
     
-    // শুধু রিলে বন্ধ করা, ইমারজেন্সি নয়
-    powerMode = 'manual';
-    activePowerSource = 'off';
+    powerButtons.forEach(btn => {
+        btn.classList.remove('active', 'manual-active', 'auto-active');
+    });
     
-    // Update UI
-    updateModeUI('manual');
-    updatePowerFlow('off');
-    
-    // Send manual stop command (not emergency)
-    const manualStopCommand = {
-        action: 'manual_stop',
-        relays: {
-            relay1: false,
-            relay2: false,
-            relay3: false
-        },
-        reason: 'User initiated manual stop (রিলে বন্ধ)',
-        timestamp: Date.now(),
-        userId: userId || 'web_user',
-        emergency: false // ইমারজেন্সি নয়
-    };
-    
-    if (database && isConnected) {
-        database.ref("solar_system/commands").set(manualStopCommand)
-            .then(() => {
-                console.log('✅ Manual stop command sent');
-                showNotification('রিলে বন্ধ করা হয়েছে (ম্যানুয়াল স্টপ)', 'warning');
-                
-                // Update current power source display
-                updateCurrentPowerSourceDisplay();
-                updateFirebaseStatus('manual', 'off');
-            })
-            .catch(error => {
-                console.error('❌ Manual stop command error:', error);
-            });
-    }
-}
-
-// ==================== EMERGENCY STOP FUNCTION ====================
-
-function emergencyStop() {
-    console.log("🛑 Emergency Stop (জরুরি বন্ধ)!");
-    
-    // First stop all intervals
-    stopAllIntervals();
-    
-    powerMode = 'stop';
-    activePowerSource = 'off';
-    
-    // Update UI
-    updateModeUI('stop');
-    updatePowerFlow('off');
-    
-    // Stop brush and pump
-    brushStatus = 'stopped';
-    pumpStatus = 'off';
-    updateBrushStatus();
-    updatePumpStatus();
-    
-    // Send stop commands for brush and pump
-    if (database && isConnected) {
-        sendBrushCommand('stop');
-        sendPumpCommand('off');
-    }
-    
-    // Send emergency stop command with emergency flag
-    const emergencyCommand = {
-        action: 'emergency_stop',
-        relays: {
-            relay1: false,
-            relay2: false,
-            relay3: false
-        },
-        reason: 'User initiated emergency stop (জরুরি বন্ধ)',
-        timestamp: Date.now(),
-        userId: userId || 'web_user',
-        emergency: true, // ইমারজেন্সি
-        system_state: 'emergency_stopped'
-    };
-    
-    if (database && isConnected) {
-        database.ref("solar_system/commands").set(emergencyCommand)
-            .then(() => {
-                console.log('✅ Emergency stop command sent');
-                showNotification('সিস্টেম জরুরি বন্ধ করা হয়েছে', 'error');
-                
-                // Update Firebase status to stop mode
-                updateFirebaseStatus('stop', 'off');
-                
-                // Update current power source display
-                updateCurrentPowerSourceDisplay();
-                
-                // Auto refresh after 5 seconds
-                setTimeout(() => {
-                    console.log("🔄 Auto-refreshing system status...");
-                    refreshSystemStatus();
-                }, 5000);
-            })
-            .catch(error => {
-                console.error('❌ Emergency stop command error:', error);
-            });
-    }
-}
-
-// ==================== REFRESH SYSTEM STATUS ====================
-
-function refreshSystemStatus() {
-    console.log("🔄 Refreshing system status...");
-    
-    if (!database || !isConnected) {
-        console.error("❌ Cannot refresh - Firebase not connected");
+    if (powerMode === 'stop') {
+        const stopBtn = document.querySelector('.power-source-btn[data-source="stop"]');
+        if (stopBtn) stopBtn.classList.add('active');
+        buttonStates.power.stop = true;
         return;
     }
     
-    // Fetch fresh data from Firebase
-    fetchInitialData();
+    if (powerMode === 'auto') {
+        const autoBtn = document.querySelector('.power-source-btn[data-source="auto"]');
+        if (autoBtn) {
+            autoBtn.classList.add('active');
+            autoBtn.classList.add('auto-active');
+        }
+        buttonStates.power.auto = true;
+        
+        const currentSourceBtn = document.querySelector(`.power-source-btn[data-source="${activePowerSource}"]`);
+        if (currentSourceBtn && activePowerSource !== 'off') {
+            currentSourceBtn.classList.add('manual-active');
+        }
+    } else if (powerMode === 'manual') {
+        if (activePowerSource === 'off') {
+            const allOffBtn = document.querySelector('.power-source-btn[data-state="off"]');
+            if (allOffBtn) allOffBtn.classList.add('manual-active');
+        } else {
+            const currentBtn = document.querySelector(`.power-source-btn[data-source="${activePowerSource}"]`);
+            if (currentBtn) {
+                currentBtn.classList.add('active');
+                currentBtn.classList.add('manual-active');
+            }
+        }
+    }
     
-    // Force UI update
-    updateModeUI(powerMode);
-    updateCurrentPowerSourceDisplay();
+    Object.keys(buttonStates.power).forEach(key => {
+        buttonStates.power[key] = false;
+    });
     
-    showNotification("সিস্টেম স্ট্যাটাস রিফ্রেশ করা হয়েছে", "info");
+    if (powerMode === 'auto') {
+        buttonStates.power.auto = true;
+    } else if (activePowerSource !== 'off') {
+        buttonStates.power[activePowerSource] = true;
+    }
 }
 
-// ==================== DEVICE CONTROL FUNCTIONS ====================
+function updateBrushButtons() {
+    const brushAutoBtn = document.getElementById('brushAutoModeBtn');
+    const brushManualBtn = document.getElementById('brushManualModeBtn');
+    const brushForwardBtn = document.getElementById('brushForwardBtn');
+    const brushReverseBtn = document.getElementById('brushReverseBtn');
+    const brushStopBtn = document.getElementById('brushPumpStopBtn');
+    
+    if (brushAutoBtn) brushAutoBtn.classList.remove('active');
+    if (brushManualBtn) brushManualBtn.classList.remove('active');
+    if (brushForwardBtn) brushForwardBtn.classList.remove('active');
+    if (brushReverseBtn) brushReverseBtn.classList.remove('active');
+    if (brushStopBtn) brushStopBtn.classList.remove('active');
+    
+    if (currentBrushMode === 'auto' && brushAutoBtn) {
+        brushAutoBtn.classList.add('active');
+        buttonStates.brush.auto = true;
+        buttonStates.brush.manual = false;
+    } else if (currentBrushMode === 'manual' && brushManualBtn) {
+        brushManualBtn.classList.add('active');
+        buttonStates.brush.auto = false;
+        buttonStates.brush.manual = true;
+    }
+    
+    switch(brushStatus) {
+        case 'forward':
+            if (brushForwardBtn) brushForwardBtn.classList.add('active');
+            buttonStates.brush.forward = true;
+            buttonStates.brush.reverse = false;
+            buttonStates.brush.stop = false;
+            break;
+        case 'reverse':
+            if (brushReverseBtn) brushReverseBtn.classList.add('active');
+            buttonStates.brush.forward = false;
+            buttonStates.brush.reverse = true;
+            buttonStates.brush.stop = false;
+            break;
+        case 'stopped':
+            if (brushStopBtn) brushStopBtn.classList.add('active');
+            buttonStates.brush.forward = false;
+            buttonStates.brush.reverse = false;
+            buttonStates.brush.stop = true;
+            break;
+    }
+}
 
-function sendBrushCommand(direction) {
+function updatePumpButtons() {
+    const pumpOnBtn = document.getElementById('pumpOnBtn');
+    const pumpOffBtn = document.getElementById('pumpOffBtn') || document.getElementById('brushPumpStopBtn');
+    
+    if (pumpOnBtn) pumpOnBtn.classList.remove('active');
+    if (pumpOffBtn) pumpOffBtn.classList.remove('active');
+    
+    if (pumpStatus === 'on' && pumpOnBtn) {
+        pumpOnBtn.classList.add('active');
+        buttonStates.pump.on = true;
+        buttonStates.pump.off = false;
+    } else if (pumpStatus === 'off' && pumpOffBtn) {
+        pumpOffBtn.classList.add('active');
+        buttonStates.pump.on = false;
+        buttonStates.pump.off = true;
+    }
+}
+
+function updateCleaningButtons() {
+    const startCleaningBtn = document.getElementById('startCleaningBtn');
+    const stopCleaningBtn = document.getElementById('stopCleaningBtn');
+    
+    if (startCleaningBtn) startCleaningBtn.classList.remove('active');
+    if (stopCleaningBtn) stopCleaningBtn.classList.remove('active');
+    
+    buttonStates.cleaning.start = false;
+    buttonStates.cleaning.stop = false;
+}
+
+// ==================== FIREBASE COMMAND FUNCTIONS ====================
+
+function sendBrushCommand(command) {
     if (!database || !isConnected) {
         console.error("❌ Firebase not connected for brush command");
         return;
     }
     
-    const command = {
+    const brushCommand = {
         action: 'brush_control',
-        direction: direction,
+        command: command,
+        mode: currentBrushMode,
         timestamp: Date.now(),
         userId: userId || 'web_user',
-        system_mode: powerMode
+        system_mode: powerMode,
+        brush_status: brushStatus
     };
     
-    console.log('📤 Sending brush command:', command);
+    console.log('📤 Sending brush command:', brushCommand);
     
-    database.ref("solar_system/commands").update(command)
+    const commandsRef = database.ref("solar_system/commands");
+    
+    commandsRef.set(brushCommand)
         .then(() => {
             console.log('✅ Brush command sent');
+            updateBrushStatusDisplay();
         })
         .catch(error => {
             console.error('❌ Brush command error:', error);
@@ -1319,40 +1347,15 @@ function sendPumpCommand(state) {
     
     console.log('📤 Sending pump command:', command);
     
-    database.ref("solar_system/commands").update(command)
+    const commandsRef = database.ref("solar_system/commands");
+    
+    commandsRef.update(command)
         .then(() => {
             console.log('✅ Pump command sent');
         })
         .catch(error => {
             console.error('❌ Pump command error:', error);
             showNotification('পাম্প কমান্ড পাঠাতে সমস্যা', 'error');
-        });
-}
-
-function sendServoCommand(direction, angle) {
-    if (!database || !isConnected) {
-        console.error("❌ Firebase not connected for servo command");
-        return;
-    }
-    
-    const command = {
-        action: 'servo_control',
-        direction: direction,
-        angle: angle,
-        timestamp: Date.now(),
-        userId: userId || 'web_user',
-        system_mode: powerMode
-    };
-    
-    console.log('📤 Sending servo command:', command);
-    
-    database.ref("solar_system/commands").update(command)
-        .then(() => {
-            console.log('✅ Servo command sent');
-        })
-        .catch(error => {
-            console.error('❌ Servo command error:', error);
-            showNotification('সার্ভো কমান্ড পাঠাতে সমস্যা', 'error');
         });
 }
 
@@ -1374,7 +1377,9 @@ function sendCleaningCommand(action, duration = 30, interval = 6) {
     
     console.log('📤 Sending cleaning command:', command);
     
-    database.ref("solar_system/commands").update(command)
+    const commandsRef = database.ref("solar_system/commands");
+    
+    commandsRef.update(command)
         .then(() => {
             console.log('✅ Cleaning command sent');
         })
@@ -1392,19 +1397,17 @@ function controlPowerSource(source, state = 'on', reason = '') {
         return;
     }
     
-    // If All Off is clicked (this should call manualStop, not emergencyStop)
     if (source === 'all' && state === 'off') {
         manualStop();
         return;
     }
     
-    // IMPORTANT: Only one relay should be ON at a time
     let relay1 = false, relay2 = false, relay3 = false;
     
     if (source === 'solar' && state === 'on') {
-        relay1 = true;   // Solar relay ON
-        relay2 = false;  // Battery relay OFF
-        relay3 = false;  // Grid relay OFF
+        relay1 = true;
+        relay2 = false;
+        relay3 = false;
     } else if (source === 'battery' && state === 'on') {
         relay1 = false;
         relay2 = true;
@@ -1414,14 +1417,12 @@ function controlPowerSource(source, state = 'on', reason = '') {
         relay2 = false;
         relay3 = true;
     } else {
-        // All OFF
         relay1 = false;
         relay2 = false;
         relay3 = false;
         activePowerSource = 'off';
     }
     
-    // Update local variables
     if (state === 'on' && source !== 'all') {
         lastPowerSource = source;
         activePowerSource = source;
@@ -1453,25 +1454,21 @@ function controlPowerSource(source, state = 'on', reason = '') {
     };
     
     console.log('📤 Sending power command to Firebase:', command);
-    console.log(`⚡ Relay States → Solar(R1):${relay1} Battery(R2):${relay2} Grid(R3):${relay3}`);
     
-    database.ref("solar_system/commands").set(command)
+    const commandsRef = database.ref("solar_system/commands");
+    
+    commandsRef.set(command)
         .then(() => {
             console.log('✅ Power command sent to Firebase');
             
-            // Update Firebase status
             updateFirebaseStatus(powerMode, source);
             
             if (state === 'on' && source !== 'all') {
-                // Update UI
                 updateUIAfterPowerSwitch(source);
-                
-                // Update current power source display
                 updateCurrentPowerSourceDisplay();
-                
                 updatePowerFlow(source);
+                updatePowerButtonsUI();
                 
-                // Show notification with reason
                 const sourceNames = {
                     'solar': 'সোলার',
                     'battery': 'ব্যাটারি',
@@ -1480,10 +1477,7 @@ function controlPowerSource(source, state = 'on', reason = '') {
                 const notificationReason = reason ? `কারণ: ${reason}` : '';
                 showNotification(`${sourceNames[source]} চালু হয়েছে ${notificationReason}`, 'success');
                 
-                // Log the switch
                 console.log(`📝 Switch recorded: ${source} at ${new Date().toLocaleTimeString()}`);
-                console.log(`   Solar: ${currentSolarVoltage.toFixed(2)}V`);
-                console.log(`   Battery: ${currentBatteryVoltage.toFixed(2)}V, SOC: ${currentBatterySOC.toFixed(1)}%`);
             }
         })
         .catch(error => {
@@ -1510,7 +1504,9 @@ function updateFirebaseStatus(mode, source) {
         }
     };
     
-    database.ref("solar_system/system_status").update(statusUpdate)
+    const statusRef = database.ref("solar_system/system_status");
+    
+    statusRef.update(statusUpdate)
         .then(() => {
             console.log("✅ Firebase status updated");
         })
@@ -1519,10 +1515,442 @@ function updateFirebaseStatus(mode, source) {
         });
 }
 
+// ==================== AUTO POWER SWITCHING ====================
+
+function startAutoPowerSwitching() {
+    console.log("🔋 Auto power switching starting...");
+    
+    stopAutoPowerSwitching();
+    
+    autoModeStartTime = Date.now();
+    retryCount = 0;
+    
+    powerMode = 'auto';
+    updateModeUI('auto');
+    updatePowerButtonsUI();
+    
+    activePowerSource = 'grid';
+    lastPowerSource = 'grid';
+    
+    updateFirebaseStatus('auto', activePowerSource);
+    
+    setTimeout(() => {
+        console.log("🚀 Auto mode: Initial data fetch...");
+        forceDataFetchForAutoMode();
+    }, 500);
+    
+    autoPowerInterval = setInterval(() => {
+        if (powerMode === 'auto' && !isSwitchingInProgress) {
+            console.log("⏰ Auto mode scheduled check (1s interval)");
+            
+            if (currentSolarVoltage === 0 && currentBatteryVoltage === 0) {
+                console.log("⚠️ No sensor data for auto check - fetching fresh data");
+                forceDataFetchForAutoMode();
+            } else {
+                checkAutoPowerConditions();
+            }
+        }
+    }, 1000);
+    
+    console.log("✅ Auto power switching started (1s interval)");
+    showNotification("অটো মোড চালু হয়েছে (প্রতি ১ সেকেন্ডে চেক)", "success");
+}
+
+// ==================== SOLAR PRIORITY FUNCTIONS ====================
+
+function shouldStayOnSolar() {
+    const solarGood = currentSolarVoltage >= AUTO_THRESHOLDS.SOLAR_MIN_FOR_OPERATION;
+    const dataGood = esp32Connected && (Date.now() - esp32LastDataTime < 30000);
+    const voltageDiff = currentSolarVoltage - currentBatteryVoltage;
+    const solarBetterThanBattery = voltageDiff > -AUTO_THRESHOLDS.HYSTERESIS;
+    const batteryGood = currentBatterySOC > AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC;
+    
+    if (solarGood && dataGood && solarBetterThanBattery && batteryGood) {
+        console.log("🔆 Solar priority: Conditions good for staying on solar");
+        return true;
+    }
+    
+    console.log("⚠️ Solar priority: Conditions not met for staying on solar");
+    return false;
+}
+
+function createSolarPriorityIndicator() {
+    const indicator = document.createElement('div');
+    indicator.id = 'solarPriorityIndicator';
+    indicator.style.cssText = `
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        background: rgba(76, 175, 80, 0.9);
+        color: white;
+        padding: 10px 15px;
+        border-radius: 5px;
+        font-weight: bold;
+        z-index: 1000;
+        display: none;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        font-size: 14px;
+    `;
+    document.body.appendChild(indicator);
+    return indicator;
+}
+
+function updateSolarPriorityIndicator() {
+    const indicator = document.getElementById('solarPriorityIndicator');
+    if (!indicator) return;
+    
+    const solarGood = currentSolarVoltage >= AUTO_THRESHOLDS.SOLAR_MIN_FOR_OPERATION;
+    const dataGood = esp32Connected && (Date.now() - esp32LastDataTime < 30000);
+    
+    if (solarGood && dataGood && activePowerSource === 'solar' && powerMode === 'auto') {
+        indicator.innerHTML = `🔆 সোলার প্রায়রি সক্রিয় (${currentSolarVoltage.toFixed(2)}V)`;
+        indicator.style.background = 'rgba(76, 175, 80, 0.9)';
+        indicator.style.color = 'white';
+        indicator.style.display = 'block';
+    } else if (activePowerSource === 'solar' && powerMode === 'auto') {
+        indicator.innerHTML = `⚠️ সোলার চলছে (${currentSolarVoltage.toFixed(2)}V)`;
+        indicator.style.background = 'rgba(255, 152, 0, 0.9)';
+        indicator.style.color = 'white';
+        indicator.style.display = 'block';
+    } else {
+        indicator.style.display = 'none';
+    }
+}
+
+function debugSolarConditions() {
+    console.log("=== সোলার কন্ডিশন ডিবাগ ===");
+    console.log(`সোলার ভোল্টেজ: ${currentSolarVoltage.toFixed(2)}V`);
+    console.log(`ব্যাটারি ভোল্টেজ: ${currentBatteryVoltage.toFixed(2)}V`);
+    console.log(`ভোল্টেজ ডিফারেন্স: ${(currentSolarVoltage - currentBatteryVoltage).toFixed(2)}V`);
+    console.log(`ব্যাটারি SOC: ${currentBatterySOC.toFixed(1)}%`);
+    console.log(`সোলার থেকে গ্রিড থ্রেশহোল্ড: ${AUTO_THRESHOLDS.SOLAR_TO_GRID_THRESHOLD}V`);
+    console.log(`সোলার মিনিমাম ফর অপারেশন: ${AUTO_THRESHOLDS.SOLAR_MIN_FOR_OPERATION}V`);
+    console.log(`সোলার ভালো কিনা: ${currentSolarVoltage >= AUTO_THRESHOLDS.SOLAR_MIN_FOR_OPERATION ? 'হ্যাঁ' : 'না'}`);
+    console.log(`কারেন্ট সোর্স: ${activePowerSource}`);
+    console.log(`মোড: ${powerMode}`);
+    console.log(`ESP32 সংযুক্ত: ${esp32Connected}`);
+    console.log("==========================");
+}
+
+function checkAutoPowerConditions() {
+    if (powerMode !== 'auto') return;
+    
+    debugSolarConditions();
+    
+    console.log("🤖 Auto mode checking conditions...");
+    console.log(`   Solar: ${currentSolarVoltage.toFixed(2)}V, Battery: ${currentBatteryVoltage.toFixed(2)}V (${currentBatterySOC.toFixed(1)}%)`);
+    
+    if (Date.now() - lastValidDataTime > AUTO_THRESHOLDS.DATA_TIMEOUT) {
+        console.log("⚠️ Auto mode: Data timeout - switching to grid");
+        executePowerSwitch('grid', 'ডেটা টাইমআউট');
+        return;
+    }
+    
+    const voltageDiff = currentSolarVoltage - currentBatteryVoltage;
+    
+    switch(activePowerSource) {
+        case 'grid':
+            if (currentSolarVoltage >= AUTO_THRESHOLDS.MIN_SOLAR_VOLTAGE_FOR_SWITCH && 
+                voltageDiff >= AUTO_THRESHOLDS.GRID_TO_SOLAR_THRESHOLD) {
+                console.log("🔆 Solar is good, switching from grid to solar");
+                executePowerSwitch('solar', `সোলার ভালো (${voltageDiff.toFixed(2)}V বেশি)`);
+            } else if (currentBatteryVoltage >= AUTO_THRESHOLDS.BATTERY_MIN_VOLTAGE && 
+                      currentBatterySOC > AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC) {
+                console.log("🔋 Battery is OK, switching from grid to battery");
+                executePowerSwitch('battery', `ব্যাটারি ভালো (${currentBatterySOC.toFixed(1)}%)`);
+            } else {
+                console.log("✅ Staying on grid - solar/battery conditions not met");
+            }
+            break;
+            
+        case 'solar':
+            if (shouldStayOnSolar()) {
+                console.log("✅ Staying on solar - solar priority mode active");
+                logAutoDecision('STAY_ON_SOLAR', 'সোলার প্রায়রি সক্রিয় - সোলারে থাকা হবে');
+                return;
+            }
+            
+            let shouldSwitchFromSolar = false;
+            let switchReason = '';
+            let targetSource = 'grid';
+            
+            if (currentSolarVoltage < AUTO_THRESHOLDS.SOLAR_TO_GRID_THRESHOLD) {
+                shouldSwitchFromSolar = true;
+                switchReason = `সোলার ভোল্টেজ খুব কম (${currentSolarVoltage.toFixed(2)}V < ${AUTO_THRESHOLDS.SOLAR_TO_GRID_THRESHOLD}V)`;
+                targetSource = 'grid';
+            } else if (voltageDiff < -AUTO_THRESHOLDS.HYSTERESIS && 
+                      currentBatteryVoltage >= AUTO_THRESHOLDS.BATTERY_MIN_VOLTAGE &&
+                      currentBatterySOC > AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC) {
+                shouldSwitchFromSolar = true;
+                switchReason = `ব্যাটারি বেশি (${(-voltageDiff).toFixed(2)}V বেশি)`;
+                targetSource = 'battery';
+            } else if (!esp32Connected || Date.now() - esp32LastDataTime > 30000) {
+                shouldSwitchFromSolar = true;
+                switchReason = 'ESP32 সংযোগ সমস্যা';
+                targetSource = 'grid';
+            } else if (currentBatterySOC <= AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC) {
+                shouldSwitchFromSolar = true;
+                switchReason = `ব্যাটারি ক্রিটিকাল (${currentBatterySOC.toFixed(1)}%)`;
+                targetSource = 'grid';
+            }
+            
+            if (shouldSwitchFromSolar) {
+                console.log(`🔄 Auto mode decision: Switch from solar to ${targetSource} - ${switchReason}`);
+                executePowerSwitch(targetSource, switchReason);
+            } else {
+                console.log("✅ Staying on solar - conditions good");
+                logAutoDecision('STAY_ON_SOLAR', 'সোলার কন্ডিশন ভালো');
+            }
+            break;
+            
+        case 'battery':
+            if (currentSolarVoltage >= AUTO_THRESHOLDS.MIN_SOLAR_VOLTAGE_FOR_SWITCH && 
+                voltageDiff >= AUTO_THRESHOLDS.SOLAR_BATTERY_DIFF) {
+                console.log("🔆 Solar is better, switching from battery to solar");
+                executePowerSwitch('solar', `সোলার ভালো (${voltageDiff.toFixed(2)}V বেশি)`);
+            } else if (currentBatteryVoltage < AUTO_THRESHOLDS.BATTERY_TO_GRID_THRESHOLD || 
+                      currentBatterySOC <= AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC) {
+                console.log("⚠️ Battery critical, switching to grid");
+                executePowerSwitch('grid', `ব্যাটারি ক্রিটিকাল (${currentBatterySOC.toFixed(1)}%)`);
+            } else {
+                console.log("✅ Staying on battery - conditions OK");
+            }
+            break;
+    }
+}
+
+function logAutoDecision(decision, details) {
+    const timestamp = new Date().toLocaleTimeString();
+    const logEntry = {
+        timestamp: timestamp,
+        decision: decision,
+        solarV: currentSolarVoltage.toFixed(2),
+        batteryV: currentBatteryVoltage.toFixed(2),
+        voltageDiff: (currentSolarVoltage - currentBatteryVoltage).toFixed(2),
+        batterySOC: currentBatterySOC.toFixed(1),
+        currentSource: activePowerSource,
+        targetSource: decision.includes('SWITCH') ? details.split(' ')[0] : activePowerSource,
+        details: details,
+        mode: powerMode,
+        esp32Connected: esp32Connected,
+        dataAge: Date.now() - lastValidDataTime
+    };
+    
+    if (database && isConnected) {
+        const logRef = database.ref('solar_system/auto_mode_logs').push();
+        logRef.set(logEntry)
+            .then(() => {
+                console.log(`📝 Auto decision logged: ${decision}`);
+            })
+            .catch(error => {
+                console.error('❌ Error logging auto decision:', error);
+            });
+    }
+    
+    console.log(`🤖 ${timestamp} - ${decision}: ${details}`);
+}
+
+function executePowerSwitch(targetSource, reason) {
+    const now = Date.now();
+    
+    if (now - lastSwitchTime < MIN_SWITCH_INTERVAL) {
+        console.log(`⏳ Skipping switch - too soon after last switch (${(now - lastSwitchTime)/1000}s)`);
+        return;
+    }
+    
+    if (targetSource === activePowerSource) {
+        console.log(`⚠️ Already on ${targetSource}, skipping switch`);
+        return;
+    }
+    
+    if (activePowerSource === 'solar' && targetSource === 'grid') {
+        if (currentSolarVoltage >= AUTO_THRESHOLDS.SOLAR_MIN_FOR_OPERATION && 
+            esp32Connected && (Date.now() - esp32LastDataTime < 30000) &&
+            currentBatterySOC > AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC) {
+            
+            console.log(`🚫 Blocked switch from solar to grid - solar is good (${currentSolarVoltage.toFixed(2)}V)`);
+            logAutoDecision('BLOCK_SWITCH_TO_GRID', `সোলার ভালো আছে (${currentSolarVoltage.toFixed(2)}V)`);
+            
+            showNotification(`সোলার ভালো আছে (${currentSolarVoltage.toFixed(2)}V), গ্রিডে সুইচ ব্লক করা হয়েছে`, 'warning');
+            
+            solarPriorityBlockCount++;
+            lastSolarPriorityBlockTime = now;
+            
+            const blockLog = {
+                timestamp: new Date().toLocaleTimeString(),
+                solar_voltage: currentSolarVoltage.toFixed(2),
+                battery_voltage: currentBatteryVoltage.toFixed(2),
+                battery_soc: currentBatterySOC.toFixed(1),
+                reason: reason,
+                block_count: solarPriorityBlockCount,
+                total_block_count: solarPriorityBlockCount
+            };
+            
+            if (database && isConnected) {
+                database.ref('solar_system/solar_priority_blocks').push(blockLog);
+            }
+            
+            return;
+        }
+    }
+    
+    console.log(`🔄 Auto switching to ${targetSource}: ${reason}`);
+    
+    logAutoDecision(`SWITCH_TO_${targetSource.toUpperCase()}`, reason);
+    
+    isSwitchingInProgress = true;
+    
+    controlPowerSource(targetSource, 'on', `অটো: ${reason}`);
+    
+    lastSwitchTime = now;
+    
+    setTimeout(() => {
+        isSwitchingInProgress = false;
+    }, 5000);
+}
+
+function forceDataFetchForAutoMode() {
+    if (!database || !isConnected) {
+        console.error("❌ Firebase not connected for force data fetch");
+        return;
+    }
+    
+    console.log("📥 Force fetching data for auto mode...");
+    
+    const currentDataRef = database.ref('solar_system/current_data');
+    
+    currentDataRef.once("value")
+        .then((snapshot) => {
+            const data = snapshot.val();
+            if (data) {
+                console.log("✅ Force data fetch successful");
+                updateSensorValuesFromFirebase(data);
+                updateDashboard(data);
+                lastValidDataTime = Date.now();
+                
+                updateSolarPriorityIndicator();
+                
+                if (powerMode === 'auto') {
+                    console.log("🔄 Checking auto conditions with forced data...");
+                    setTimeout(() => {
+                        checkAutoPowerConditions();
+                    }, 1000);
+                }
+            } else {
+                console.log("❌ No data even after force fetch");
+                
+                if (powerMode === 'auto') {
+                    console.log("⚠️ Auto mode: Switching to grid (no data after force fetch)");
+                    if (activePowerSource !== 'grid') {
+                        executePowerSwitch('grid', 'ফোর্স ডেটা ফেচেও ডেটা না পাওয়ায় গ্রিডে সুইচ');
+                    }
+                }
+            }
+        })
+        .catch(error => {
+            console.error("❌ Force data fetch error:", error);
+        });
+}
+
+function stopAutoPowerSwitching() {
+    console.log("🛑 Stopping auto power switching...");
+    
+    if (autoPowerInterval) {
+        clearInterval(autoPowerInterval);
+        autoPowerInterval = null;
+    }
+    
+    if (autoCheckInterval) {
+        clearInterval(autoCheckInterval);
+        autoCheckInterval = null;
+    }
+    
+    const indicator = document.getElementById('solarPriorityIndicator');
+    if (indicator) {
+        indicator.style.display = 'none';
+    }
+    
+    console.log("✅ Auto power switching stopped");
+}
+
+// ==================== MODE SWITCHING FUNCTIONS ====================
+
+function switchToMode(mode) {
+    console.log(`🔄 Switching to ${mode} mode`);
+    
+    switch(mode) {
+        case 'auto':
+            if (powerMode !== 'auto') {
+                powerMode = 'auto';
+                updateModeUI('auto');
+                updatePowerButtonsUI();
+                startAutoPowerSwitching();
+                showNotification('অটো মোড চালু হয়েছে', 'success');
+                updateFirebaseStatus('auto', activePowerSource);
+            }
+            break;
+            
+        case 'manual':
+            if (powerMode !== 'manual') {
+                stopAutoPowerSwitching();
+                powerMode = 'manual';
+                updateModeUI('manual');
+                updatePowerButtonsUI();
+                showNotification('ম্যানুয়াল মোড চালু হয়েছে', 'info');
+                updateFirebaseStatus('manual', activePowerSource);
+            }
+            break;
+            
+        case 'stop':
+            if (powerMode !== 'stop') {
+                if (confirm('সিস্টেম জরুরি বন্ধ করতে চান?')) {
+                    emergencyStop();
+                }
+            }
+            break;
+    }
+}
+
+function updateModeUI(mode) {
+    console.log("Updating mode UI to:", mode);
+    
+    updateModeButtons();
+    
+    const panel = document.getElementById('manualControlPanel');
+    if (panel) {
+        panel.style.display = mode === 'manual' ? 'block' : 'none';
+    }
+    
+    updateModeIndicator(mode);
+    updateCurrentPowerSourceDisplay();
+}
+
+function updateModeIndicator(mode) {
+    const modeIndicator = document.getElementById('mode_indicator');
+    if (!modeIndicator) return;
+    
+    switch(mode) {
+        case 'auto':
+            modeIndicator.textContent = 'অটো মোড';
+            modeIndicator.className = 'auto-indicator';
+            break;
+        case 'manual':
+            modeIndicator.textContent = 'ম্যানুয়াল মোড';
+            modeIndicator.className = 'manual-indicator';
+            break;
+        case 'stop':
+            modeIndicator.textContent = 'জরুরি বন্ধ';
+            modeIndicator.className = 'stop-indicator';
+            break;
+        default:
+            modeIndicator.textContent = mode;
+            modeIndicator.className = '';
+    }
+}
+
 // ==================== UI UPDATE FUNCTIONS ====================
 
 function updateUIAfterPowerSwitch(source) {
-    // Update mode indicator
     const mode = powerMode === 'auto' ? (
         source === 'solar' ? 'auto_solar' :
         source === 'battery' ? 'auto_battery' :
@@ -1530,18 +1958,14 @@ function updateUIAfterPowerSwitch(source) {
     ) : 'manual';
     
     updateModeIndicator(mode);
-    
-    // Update current power source text
     updateCurrentPowerSourceText();
-    
-    // Update power flow visualization
     updatePowerFlow(source);
+    updatePowerButtonsUI();
     
-    // Update active button
-    updateActivePowerSourceButton(source);
+    updateSolarPriorityIndicator();
 }
 
-function updateCurrentPowerSourceDisplay() {
+function updateCurrentPowerSourceDisplay(source = activePowerSource) {
     const currentPowerSourceEl = document.getElementById('currentPowerSource');
     if (!currentPowerSourceEl) return;
     
@@ -1563,359 +1987,1108 @@ function updateCurrentPowerSourceDisplay() {
     
     if (powerMode === 'stop') {
         currentPowerSourceEl.textContent = 'সিস্টেম জরুরি বন্ধ' + modeText;
-        currentPowerSourceEl.style.color = '#F44336'; // লাল রঙ
-    } else if (activePowerSource === 'off') {
-        currentPowerSourceEl.textContent = 'সিস্টেম বন্ধ (ম্যানুয়াল)' + modeText;
-        currentPowerSourceEl.style.color = '#FF9800'; // কমলা রঙ
+        currentPowerSourceEl.className = 'off';
+    } else if (source === 'off') {
+        currentPowerSourceEl.textContent = 'সিস্টেম বন্ধ' + modeText;
+        currentPowerSourceEl.className = 'off';
     } else {
         currentPowerSourceEl.textContent = 
-            sourceNames[activePowerSource] + ' → লোড' + modeText;
-        
-        const colors = {
-            'solar': '#FF9800',
-            'battery': '#4CAF50',
-            'grid': '#2196F3'
-        };
-        currentPowerSourceEl.style.color = colors[activePowerSource] || '#000';
+            sourceNames[source] + ' → লোড' + modeText;
+        currentPowerSourceEl.className = source;
     }
-}
-
-function updateModeIndicator(mode) {
-    const indicator = document.getElementById('mode_indicator');
-    if (!indicator) return;
-    
-    const modeTexts = {
-        'auto': 'অটো মোড',
-        'auto_solar': 'অটো মোড (সোলার)',
-        'auto_battery': 'অটো মোড (ব্যাটারি)',
-        'auto_grid': 'অটো মোড (গ্রিড)',
-        'manual': 'ম্যানুয়াল মোড',
-        'stop': 'জরুরি বন্ধ'
-    };
-    
-    indicator.textContent = modeTexts[mode] || 'অটো মোড';
-    indicator.className = mode === 'auto' ? 'auto-indicator' : 
-                         mode === 'stop' ? 'stop-indicator' : 'manual-indicator';
 }
 
 function updateCurrentPowerSourceText() {
-    const el = document.querySelector('.current-source-text');
-    if (!el) return;
-    
-    const texts = {
+    const sourceNames = {
         'solar': 'সোলার',
         'battery': 'ব্যাটারি',
         'grid': 'গ্রিড',
-        'off': 'বন্ধ',
-        'auto': 'অটো'
+        'off': 'বন্ধ'
     };
     
-    el.textContent = texts[activePowerSource] || activePowerSource;
-}
-
-function updateActivePowerSourceButton(source) {
-    // Remove active class from all buttons
-    document.querySelectorAll('.power-source-btn').forEach(btn => {
-        btn.classList.remove('active');
-        btn.classList.remove('manual-active');
-    });
-    
-    // Add appropriate class
-    if (powerMode === 'manual' && source !== 'auto') {
-        const manualBtn = document.querySelector(`.power-source-btn[data-source="${source}"]`);
-        if (manualBtn) {
-            manualBtn.classList.add('manual-active');
-        }
-    } else if (source === 'auto' || powerMode === 'auto') {
-        const autoBtn = document.querySelector('.power-source-btn[data-source="auto"]');
-        if (autoBtn) {
-            autoBtn.classList.add('active');
-        }
-    }
-}
-
-function updateModeUI(mode) {
-    console.log("Updating mode UI to:", mode);
-    
-    // Update mode buttons
-    const autoBtn = document.getElementById('autoModeBtn');
-    const manualBtn = document.getElementById('manualModeBtn');
-    const stopBtn = document.getElementById('stopModeBtn');
-    const panel = document.getElementById('manualControlPanel');
-    
-    // Remove active class from all
-    if (autoBtn) autoBtn.classList.remove('active');
-    if (manualBtn) manualBtn.classList.remove('active');
-    if (stopBtn) stopBtn.classList.remove('active');
-    
-    // Add active class to current mode
-    if (mode === 'auto' && autoBtn) autoBtn.classList.add('active');
-    if (mode === 'manual' && manualBtn) manualBtn.classList.add('active');
-    if (mode === 'stop' && stopBtn) stopBtn.classList.add('active');
-    
-    // Show/hide manual control panel
-    if (panel) {
-        panel.style.display = mode === 'manual' ? 'block' : 'none';
-    }
-    
-    // Update mode indicator
-    updateModeIndicator(mode);
-    
-    // Update current power source display
-    updateCurrentPowerSourceDisplay();
+    const modeText = powerMode === 'auto' ? ' (অটো)' : powerMode === 'manual' ? ' (ম্যানুয়াল)' : '';
+    return sourceNames[activePowerSource] + modeText;
 }
 
 function updatePowerFlow(source) {
-    const diagram = document.getElementById('powerFlowDiagram');
-    if (!diagram) return;
+    const pathItems = document.querySelectorAll('.path-item');
+    const pathArrows = document.querySelectorAll('.path-arrow');
+    const currentPowerSourceEl = document.getElementById('currentPowerSource');
     
-    // Reset all
-    diagram.querySelectorAll('.path-item').forEach(item => {
-        item.classList.remove('active');
-        item.style.background = '#f5f5f5';
-        item.style.color = '#999';
-        item.style.opacity = '0.7';
+    pathItems.forEach(item => {
+        item.classList.remove('active', 'solar-active', 'battery-active', 'grid-active');
+        item.style.opacity = '0.6';
     });
     
-    diagram.querySelectorAll('.path-arrow').forEach(arrow => {
-        arrow.classList.remove('active');
-        arrow.style.color = '#666';
+    pathArrows.forEach(arrow => {
+        arrow.classList.remove('active', 'solar-active', 'battery-active', 'grid-active');
+        arrow.style.opacity = '0.6';
     });
     
-    // Remove all active classes
-    diagram.classList.remove('solar-active', 'battery-active', 'grid-active', 'off-state');
-    
-    if (source === 'off') {
-        diagram.classList.add('off-state');
-        return;
+    if (currentPowerSourceEl) {
+        currentPowerSourceEl.className = '';
+        currentPowerSourceEl.classList.add(source);
     }
     
-    const colors = {
-        'solar': '#FF9800',
-        'battery': '#4CAF50',
-        'grid': '#2196F3'
-    };
-    
-    const color = colors[source] || '#9C27B0';
-    
-    // Highlight active path
-    const sourceItem = diagram.querySelector(`.path-item[data-id="${source}"]`);
-    const loadItem = diagram.querySelector('.path-item[data-id="load"]');
-    const arrow = diagram.querySelector(`.path-arrow[data-from="${source}"]`);
-    
-    if (sourceItem) {
-        sourceItem.classList.add('active');
-        sourceItem.style.background = color;
-        sourceItem.style.color = 'white';
-        sourceItem.style.opacity = '1';
+    switch(source) {
+        case 'solar':
+            const solarItem = document.querySelector('.path-item[data-id="solar"]');
+            const solarArrow = document.querySelector('.path-arrow[data-from="solar"]');
+            const loadItemSolar = document.querySelector('.path-item[data-id="load"]');
+            
+            if (solarItem) {
+                solarItem.classList.add('active', 'solar-active');
+                solarItem.style.opacity = '1';
+            }
+            if (solarArrow) {
+                solarArrow.classList.add('active', 'solar-active');
+                solarArrow.style.opacity = '1';
+            }
+            if (loadItemSolar) {
+                loadItemSolar.classList.add('active', 'solar-active');
+                loadItemSolar.style.opacity = '1';
+            }
+            
+            updateCurrentPowerSourceDisplay('solar');
+            break;
+            
+        case 'battery':
+            const batteryItem = document.querySelector('.path-item[data-id="battery"]');
+            const batteryArrow = document.querySelector('.path-arrow[data-from="battery"]');
+            const loadItemBattery = document.querySelector('.path-item[data-id="load"]');
+            
+            if (batteryItem) {
+                batteryItem.classList.add('active', 'battery-active');
+                batteryItem.style.opacity = '1';
+            }
+            if (batteryArrow) {
+                batteryArrow.classList.add('active', 'battery-active');
+                batteryArrow.style.opacity = '1';
+            }
+            if (loadItemBattery) {
+                loadItemBattery.classList.add('active', 'battery-active');
+                loadItemBattery.style.opacity = '1';
+            }
+            
+            updateCurrentPowerSourceDisplay('battery');
+            break;
+            
+        case 'grid':
+            const gridItem = document.querySelector('.path-item[data-id="grid"]');
+            const gridArrow = document.querySelector('.path-arrow[data-from="load"]');
+            const loadItemGrid = document.querySelector('.path-item[data-id="load"]');
+            
+            if (gridItem) {
+                gridItem.classList.add('active', 'grid-active');
+                gridItem.style.opacity = '1';
+            }
+            if (gridArrow) {
+                gridArrow.classList.add('active', 'grid-active');
+                gridArrow.style.opacity = '1';
+            }
+            if (loadItemGrid) {
+                loadItemGrid.classList.add('active', 'grid-active');
+                loadItemGrid.style.opacity = '1';
+            }
+            
+            updateCurrentPowerSourceDisplay('grid');
+            break;
+            
+        case 'off':
+            pathItems.forEach(item => {
+                item.style.opacity = '0.4';
+            });
+            pathArrows.forEach(arrow => {
+                arrow.style.opacity = '0.4';
+            });
+            
+            updateCurrentPowerSourceDisplay('off');
+            break;
     }
     
-    if (loadItem) {
-        loadItem.classList.add('active');
-        loadItem.style.background = color;
-        loadItem.style.color = 'white';
-        loadItem.style.opacity = '1';
-    }
-    
-    if (arrow) {
-        arrow.classList.add('active');
-        arrow.style.color = color;
-    }
-    
-    diagram.classList.add(`${source}-active`);
+    console.log(`🔌 Power flow updated: ${source}`);
 }
 
-function updateBrushStatus() {
-    const statusEl = document.getElementById('brushStatus');
-    const dirEl = document.getElementById('brushDirection');
-    
-    if (statusEl) {
-        const statusText = {
-            'stopped': 'বন্ধ',
-            'forward': 'ফরওয়ার্ড চলছে',
-            'reverse': 'রিভার্স চলছে'
-        };
-        statusEl.textContent = statusText[brushStatus] || brushStatus;
-        statusEl.style.color = brushStatus === 'stopped' ? '#F44336' : '#4CAF50';
-    }
-    
-    if (dirEl) {
-        const dirText = {
-            'forward': 'ফরওয়ার্ড',
-            'reverse': 'রিভার্স'
-        };
-        dirEl.textContent = dirText[brushStatus] || '-';
-        dirEl.style.color = brushStatus === 'forward' ? '#2196F3' : 
-                          brushStatus === 'reverse' ? '#FF9800' : '#666';
-    }
-}
+// ==================== DASHBOARD DATA UPDATES ====================
 
-function updatePumpStatus() {
-    const statusEl = document.getElementById('pumpStatus');
-    if (statusEl) {
-        statusEl.textContent = pumpStatus === 'on' ? 'চালু' : 'বন্ধ';
-        statusEl.style.color = pumpStatus === 'on' ? '#4CAF50' : '#F44336';
-    }
+function updateSensorValuesFromFirebase(data) {
+    currentSolarVoltage = parseFloat(data.solar_voltage) || 0;
+    currentBatteryVoltage = parseFloat(data.battery_voltage) || 0;
+    currentBatterySOC = parseFloat(data.battery_soc) || 0;
+    solarCurrent = parseFloat(data.solar_current) || 0;
+    batteryCurrent = parseFloat(data.battery_current) || 0;
+    loadCurrent = parseFloat(data.load_current) || 0;
 }
-
-// ==================== DASHBOARD UPDATES ====================
 
 function updateDashboard(data) {
-    if (!data) {
-        console.log("⚠️ No data to update dashboard");
-        return;
+    updateElementValue('.solar_v', formatValue(data.solar_voltage, 'V'));
+    updateElementValue('.battery_v', formatValue(data.battery_voltage, 'V'));
+    updateElementValue('.load_v', formatValue(data.load_voltage, 'V'));
+    
+    updateElementValue('.solar_a', formatValue(data.solar_current, 'A'));
+    updateElementValue('.battery_a', formatValue(data.battery_current, 'A'));
+    updateElementValue('.load_a', formatValue(data.load_current, 'A'));
+    
+    const solarPower = (parseFloat(data.solar_voltage) || 0) * (parseFloat(data.solar_current) || 0);
+    const batteryPower = (parseFloat(data.battery_voltage) || 0) * (parseFloat(data.battery_current) || 0);
+    const loadPower = (parseFloat(data.load_voltage) || 0) * (parseFloat(data.load_current) || 0);
+    
+    updateElementValue('.solar_w', formatValue(solarPower, 'W'));
+    updateElementValue('.battery_w', formatValue(batteryPower, 'W'));
+    updateElementValue('.load_w', formatValue(loadPower, 'W'));
+    
+    updateElementValue('.battery_soc', formatValue(data.battery_soc, '%'));
+    
+    const batteryProgressBar = document.getElementById('batteryProgressBar');
+    if (batteryProgressBar) {
+        const soc = Math.min(100, Math.max(0, parseFloat(data.battery_soc) || 0));
+        batteryProgressBar.style.width = soc + '%';
+        
+        if (soc < 20) {
+            batteryProgressBar.style.backgroundColor = '#F44336';
+        } else if (soc < 50) {
+            batteryProgressBar.style.backgroundColor = '#FF9800';
+        } else {
+            batteryProgressBar.style.backgroundColor = '#4CAF50';
+        }
     }
     
-    const format = (value, decimals = 2) => {
-        const num = parseFloat(value);
-        return isNaN(num) ? "0.00" : num.toFixed(decimals);
-    };
+    const batteryHealth = document.getElementById('batteryHealthStatus');
+    if (batteryHealth) {
+        const soc = parseFloat(data.battery_soc) || 0;
+        if (soc > 80) {
+            batteryHealth.textContent = 'অতি ভালো';
+            batteryHealth.style.color = '#4CAF50';
+        } else if (soc > 50) {
+            batteryHealth.textContent = 'ভালো';
+            batteryHealth.style.color = '#8BC34A';
+        } else if (soc > 30) {
+            batteryHealth.textContent = 'স্বাভাবিক';
+            batteryHealth.style.color = '#FFC107';
+        } else if (soc > 20) {
+            batteryHealth.textContent = 'সতর্কতা';
+            batteryHealth.style.color = '#FF9800';
+        } else {
+            batteryHealth.textContent = 'ঝুঁকিপূর্ণ';
+            batteryHealth.style.color = '#F44336';
+        }
+    }
     
-    // Update solar values
-    updateElements('.solar_v', format(data.solar_voltage || 0), 'V');
-    updateElements('.solar_a', format(data.solar_current || 0), 'A');
-    updateElements('.solar_w', format((data.solar_voltage || 0) * (data.solar_current || 0)), 'W');
+    const dustElement = document.getElementById('dust');
+    if (dustElement && data.dust_level) {
+        dustElement.textContent = formatValue(data.dust_level, 'μg/m³');
+    }
     
-    // Update battery values
-    updateElements('.battery_v', format(data.battery_voltage || 0), 'V');
-    updateElements('.battery_a', format(data.battery_current || 0), 'A');
-    updateElements('.battery_w', format((data.battery_voltage || 0) * (data.battery_current || 0)), 'W');
-    updateElements('.battery_soc', format(data.battery_soc || 0, 1), '%');
+    const efficiencyElement = document.getElementById('efficiency');
+    if (efficiencyElement && data.efficiency) {
+        efficiencyElement.textContent = formatValue(data.efficiency, '%');
+    }
     
-    // Update load values
-    updateElements('.load_v', format(data.load_voltage || 0), 'V');
-    updateElements('.load_a', format(data.load_current || 0), 'A');
-    updateElements('.load_w', format((data.load_voltage || 0) * (data.load_current || 0)), 'W');
+    const chargingIndicator = document.getElementById('chargingIndicator');
+    if (chargingIndicator) {
+        if (parseFloat(data.solar_current) > 0.1 && parseFloat(data.battery_current) > 0) {
+            chargingIndicator.style.display = 'inline-block';
+            chargingIndicator.style.color = '#4CAF50';
+        } else {
+            chargingIndicator.style.display = 'none';
+        }
+    }
     
-    // Update other values
-    updateElementById('total_energy', format(data.total_energy || 0), 'Wh');
-    updateElementById('efficiency', format(data.efficiency || 0, 1), '%');
-    updateElementById('dust', format(data.dust_level || 0), 'μg/m³');
+    const lastSyncElement = document.getElementById('last_sync');
+    if (lastSyncElement) {
+        const now = new Date();
+        lastSyncElement.textContent = now.toLocaleTimeString('bn-BD', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        });
+    }
     
-    // Update battery progress
-    updateBatteryProgress(data.battery_soc || 0);
-    
-    // Update last sync time
-    updateLastSyncTime(data.timestamp || Date.now());
+    updateHistoryTable(data);
+    updateCharts(data);
+    checkForAlerts(data);
 }
 
-function updateElements(selector, value, unit) {
+function updateElementValue(selector, value) {
     const elements = document.querySelectorAll(selector);
-    elements.forEach(el => {
-        if (el) {
-            el.innerHTML = `<span class="value">${value}</span><span class="unit">${unit}</span>`;
+    elements.forEach(element => {
+        const valueSpan = element.querySelector('.value-number') || element;
+        valueSpan.textContent = value;
+        
+        if (!valueSpan.querySelector('.unit') && selector.includes('_v') || selector.includes('_a') || selector.includes('_w')) {
+            const unit = document.createElement('span');
+            unit.className = 'unit';
+            if (selector.includes('_v')) unit.textContent = ' V';
+            else if (selector.includes('_a')) unit.textContent = ' A';
+            else if (selector.includes('_w')) unit.textContent = ' W';
+            valueSpan.appendChild(unit);
         }
     });
 }
 
-function updateElementById(id, value, unit) {
-    const el = document.getElementById(id);
-    if (el) {
-        el.innerHTML = `<span class="value">${value}</span><span class="unit">${unit}</span>`;
+function formatValue(value, unit) {
+    if (value === null || value === undefined) return '0.00';
+    
+    const numValue = parseFloat(value);
+    if (isNaN(numValue)) return '0.00';
+    
+    const formatted = numValue.toFixed(2);
+    
+    if (typeof unit === 'string' && unit.length > 0) {
+        return formatted;
     }
+    
+    return formatted + unit;
 }
 
-function updateBatteryProgress(soc) {
-    const bar = document.getElementById('batteryProgressBar');
-    if (!bar) return;
-    
-    const percent = Math.min(Math.max(parseFloat(soc), 0), 100);
-    bar.style.width = `${percent}%`;
-    
-    if (percent >= 70) {
-        bar.style.background = 'linear-gradient(90deg, #4CAF50, #8BC34A)';
-    } else if (percent >= 30) {
-        bar.style.background = 'linear-gradient(90deg, #FF9800, #FFC107)';
-    } else {
-        bar.style.background = 'linear-gradient(90deg, #F44336, #FF5722)';
+// ==================== HISTORY TABLE FUNCTIONS ====================
+
+function updateHistoryTable(data) {
+    const historyBody = document.getElementById('history_body');
+    if (!historyBody) {
+        console.error("❌ History table body not found");
+        return;
     }
-}
-
-function updateLastSyncTime(timestamp) {
-    const el = document.getElementById('last_sync');
-    if (!el) return;
     
-    const time = new Date(timestamp);
-    el.textContent = time.toLocaleTimeString('bn-BD', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
-    });
-}
-
-// ==================== SYSTEM FUNCTIONS ====================
-
-function updateSystemTime() {
-    const el = document.getElementById('systemTime');
-    if (!el) return;
+    if (historyBody.innerHTML.includes('লোড হচ্ছে') || historyBody.innerHTML.includes('Loading')) {
+        historyBody.innerHTML = '';
+    }
     
     const now = new Date();
-    const timeString = now.toLocaleTimeString('bn-BD', {
+    const timeStr = now.toLocaleTimeString('bn-BD', {
         hour: '2-digit',
         minute: '2-digit',
         second: '2-digit'
     });
-    const dateString = now.toLocaleDateString('bn-BD', {
-        weekday: 'long',
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric'
-    });
     
-    el.innerHTML = `
-        <span class="time">${timeString}</span><br>
-        <small class="date">${dateString}</small>
-    `;
+    const row = document.createElement('tr');
+    
+    const timeCell = document.createElement('td');
+    timeCell.textContent = timeStr;
+    timeCell.className = 'time-cell';
+    row.appendChild(timeCell);
+    
+    const solarCell = document.createElement('td');
+    solarCell.textContent = formatValue(data.solar_voltage, 'V');
+    solarCell.className = 'voltage-cell';
+    row.appendChild(solarCell);
+    
+    const batteryCell = document.createElement('td');
+    batteryCell.textContent = formatValue(data.battery_voltage, 'V');
+    batteryCell.className = 'voltage-cell';
+    row.appendChild(batteryCell);
+    
+    const solarCurrentCell = document.createElement('td');
+    solarCurrentCell.textContent = formatValue(data.solar_current, 'A');
+    solarCurrentCell.className = 'current-cell';
+    row.appendChild(solarCurrentCell);
+    
+    const socCell = document.createElement('td');
+    socCell.textContent = formatValue(data.battery_soc, '%');
+    socCell.className = 'soc-cell';
+    row.appendChild(socCell);
+    
+    const dustCell = document.createElement('td');
+    dustCell.textContent = data.dust_level ? formatValue(data.dust_level, 'μg/m³') : '-';
+    dustCell.className = 'dust-cell';
+    row.appendChild(dustCell);
+    
+    historyBody.insertBefore(row, historyBody.firstChild);
+    
+    while (historyBody.children.length > 10) {
+        historyBody.removeChild(historyBody.lastChild);
+    }
+    
+    console.log("📊 History table updated with new data");
 }
 
-// ==================== HELPER FUNCTIONS ====================
+// ==================== ALERTS SYSTEM ====================
 
-function updateConnectionUI(isConnected) {
-    const indicator = document.getElementById('connectionIndicator');
-    const cloudStatus = document.getElementById('cloud_status');
+function initAlertsSystem() {
+    console.log("🚨 Initializing alerts system...");
     
+    alerts = [];
+    updateAlertsDisplay();
+    
+    setInterval(() => {
+        checkSystemAlerts();
+    }, 30000);
+}
+
+function checkForAlerts(data) {
+    const newAlerts = [];
+    
+    if (currentSolarVoltage < AUTO_THRESHOLDS.SOLAR_MIN_VOLTAGE && currentSolarVoltage > 0) {
+        newAlerts.push({
+            type: 'warning',
+            message: `সোলার ভোল্টেজ কম: ${currentSolarVoltage.toFixed(2)}V`,
+            timestamp: new Date().toLocaleTimeString(),
+            priority: 'medium'
+        });
+    }
+    
+    if (currentBatteryVoltage < AUTO_THRESHOLDS.BATTERY_MIN_VOLTAGE && currentBatteryVoltage > 0) {
+        newAlerts.push({
+            type: 'warning',
+            message: `ব্যাটারি ভোল্টেজ কম: ${currentBatteryVoltage.toFixed(2)}V`,
+            timestamp: new Date().toLocaleTimeString(),
+            priority: 'high'
+        });
+    }
+    
+    if (currentBatterySOC <= AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC && currentBatterySOC > 0) {
+        newAlerts.push({
+            type: 'error',
+            message: `ব্যাটারি ক্রিটিকাল: ${currentBatterySOC.toFixed(1)}%`,
+            timestamp: new Date().toLocaleTimeString(),
+            priority: 'critical'
+        });
+    }
+    
+    if (!esp32Connected && powerMode === 'auto') {
+        newAlerts.push({
+            type: 'error',
+            message: 'ESP32 সংযোগ বিচ্ছিন্ন',
+            timestamp: new Date().toLocaleTimeString(),
+            priority: 'high'
+        });
+    }
+    
+    if (Date.now() - lastValidDataTime > AUTO_THRESHOLDS.DATA_TIMEOUT / 2) {
+        newAlerts.push({
+            type: 'warning',
+            message: 'ডেটা আপডেট বিলম্বিত হচ্ছে',
+            timestamp: new Date().toLocaleTimeString(),
+            priority: 'medium'
+        });
+    }
+    
+    newAlerts.forEach(alert => {
+        addAlert(alert);
+    });
+}
+
+function checkSystemAlerts() {
+    if (powerMode === 'auto' && activePowerSource === 'grid' && currentSolarVoltage > 13) {
+        addAlert({
+            type: 'info',
+            message: `সোলার ভালো আছে (${currentSolarVoltage.toFixed(2)}V) কিন্তু গ্রিডে চলছে`,
+            timestamp: new Date().toLocaleTimeString(),
+            priority: 'low'
+        });
+    }
+}
+
+function addAlert(alert) {
+    const existingAlert = alerts.find(a => a.message === alert.message);
+    if (existingAlert) {
+        existingAlert.timestamp = alert.timestamp;
+    } else {
+        alerts.unshift(alert);
+        
+        if (alerts.length > MAX_ALERTS) {
+            alerts.pop();
+        }
+        
+        if (alert.priority === 'critical' || alert.priority === 'high') {
+            showNotification(alert.message, alert.type);
+        }
+    }
+    
+    updateAlertsDisplay();
+}
+
+function updateAlertsDisplay() {
+    const alertsContainer = document.getElementById('recent_alerts');
+    const alertsCount = document.getElementById('alertsCount');
+    
+    if (!alertsContainer) {
+        console.error("❌ Alerts container not found");
+        return;
+    }
+    
+    if (alertsCount) {
+        alertsCount.textContent = alerts.length;
+        alertsCount.style.display = alerts.length > 0 ? 'inline-block' : 'none';
+    }
+    
+    alertsContainer.innerHTML = '';
+    
+    if (alerts.length === 0) {
+        const emptyAlert = document.createElement('div');
+        emptyAlert.className = 'alert-empty';
+        emptyAlert.textContent = 'কোনো অ্যালার্ট নেই';
+        alertsContainer.appendChild(emptyAlert);
+        return;
+    }
+    
+    alerts.forEach(alert => {
+        const alertElement = document.createElement('div');
+        alertElement.className = `alert-item alert-${alert.type}`;
+        
+        const alertIcon = document.createElement('i');
+        if (alert.type === 'error') {
+            alertIcon.className = 'fas fa-exclamation-circle';
+        } else if (alert.type === 'warning') {
+            alertIcon.className = 'fas fa-exclamation-triangle';
+        } else {
+            alertIcon.className = 'fas fa-info-circle';
+        }
+        
+        const alertContent = document.createElement('div');
+        alertContent.className = 'alert-content';
+        
+        const alertMessage = document.createElement('div');
+        alertMessage.className = 'alert-message';
+        alertMessage.textContent = alert.message;
+        
+        const alertTime = document.createElement('div');
+        alertTime.className = 'alert-time';
+        alertTime.textContent = alert.timestamp;
+        
+        alertContent.appendChild(alertMessage);
+        alertContent.appendChild(alertTime);
+        
+        alertElement.appendChild(alertIcon);
+        alertElement.appendChild(alertContent);
+        
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'alert-close';
+        closeBtn.innerHTML = '&times;';
+        closeBtn.onclick = function(e) {
+            e.stopPropagation();
+            removeAlert(alert.message);
+        };
+        
+        alertElement.appendChild(closeBtn);
+        
+        alertsContainer.appendChild(alertElement);
+    });
+    
+    console.log(`🚨 Alerts displayed: ${alerts.length}`);
+}
+
+function removeAlert(message) {
+    const index = alerts.findIndex(alert => alert.message === message);
+    if (index !== -1) {
+        alerts.splice(index, 1);
+        updateAlertsDisplay();
+    }
+}
+
+function clearAllAlerts() {
+    alerts = [];
+    updateAlertsDisplay();
+    showNotification('সমস্ত অ্যালার্ট মুছে ফেলা হয়েছে', 'info');
+}
+
+// ==================== CHART FUNCTIONS ====================
+
+function initCharts() {
+    console.log("📊 Initializing charts...");
+    
+    if (typeof Chart === 'undefined') {
+        console.error("❌ Chart.js not loaded!");
+        loadChartJS();
+        return;
+    }
+    
+    try {
+        const voltageCtx = document.getElementById('voltageChart');
+        if (voltageCtx) {
+            voltageChart = new Chart(voltageCtx, {
+                type: 'line',
+                data: {
+                    labels: timeLabels,
+                    datasets: [
+                        {
+                            label: 'সোলার ভোল্টেজ',
+                            data: [],
+                            borderColor: '#FF6384',
+                            backgroundColor: 'rgba(255, 99, 132, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.4,
+                            fill: true,
+                            pointRadius: 2,
+                            pointBackgroundColor: '#FF6384'
+                        },
+                        {
+                            label: 'ব্যাটারি ভোল্টেজ',
+                            data: [],
+                            borderColor: '#36A2EB',
+                            backgroundColor: 'rgba(54, 162, 235, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.4,
+                            fill: true,
+                            pointRadius: 2,
+                            pointBackgroundColor: '#36A2EB'
+                        },
+                        {
+                            label: 'লোড ভোল্টেজ',
+                            data: [],
+                            borderColor: '#FFCE56',
+                            backgroundColor: 'rgba(255, 206, 86, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.4,
+                            fill: true,
+                            pointRadius: 2,
+                            pointBackgroundColor: '#FFCE56'
+                        }
+                    ]
+                },
+                options: getChartOptions('ভোল্টেজ ট্রেন্ড (V)', 'V')
+            });
+            console.log("✅ Voltage chart initialized");
+        }
+        
+        const currentCtx = document.getElementById('currentChart');
+        if (currentCtx) {
+            currentChart = new Chart(currentCtx, {
+                type: 'line',
+                data: {
+                    labels: timeLabels,
+                    datasets: [
+                        {
+                            label: 'সোলার কারেন্ট',
+                            data: [],
+                            borderColor: '#4BC0C0',
+                            backgroundColor: 'rgba(75, 192, 192, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.4,
+                            fill: true,
+                            pointRadius: 2,
+                            pointBackgroundColor: '#4BC0C0'
+                        },
+                        {
+                            label: 'ব্যাটারি কারেন্ট',
+                            data: [],
+                            borderColor: '#9966FF',
+                            backgroundColor: 'rgba(153, 102, 255, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.4,
+                            fill: true,
+                            pointRadius: 2,
+                            pointBackgroundColor: '#9966FF'
+                        },
+                        {
+                            label: 'লোড কারেন্ট',
+                            data: [],
+                            borderColor: '#FF9F40',
+                            backgroundColor: 'rgba(255, 159, 64, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.4,
+                            fill: true,
+                            pointRadius: 2,
+                            pointBackgroundColor: '#FF9F40'
+                        }
+                    ]
+                },
+                options: getChartOptions('কারেন্ট ট্রেন্ড (A)', 'A')
+            });
+            console.log("✅ Current chart initialized");
+        }
+        
+        setTimeout(addDemoChartData, 1000);
+        
+    } catch (error) {
+        console.error("❌ Chart initialization error:", error);
+        showNotification("চার্ট শুরু করতে সমস্যা", "error");
+    }
+}
+
+function loadChartJS() {
+    if (typeof Chart !== 'undefined') {
+        initCharts();
+        return;
+    }
+    
+    console.log("📥 Loading Chart.js from CDN...");
+    
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js';
+    script.onload = function() {
+        console.log("✅ Chart.js loaded successfully");
+        initCharts();
+    };
+    script.onerror = function() {
+        console.error("❌ Failed to load Chart.js");
+        showNotification("চার্ট লাইব্রেরি লোড করা যায়নি", "error");
+    };
+    document.head.appendChild(script);
+}
+
+function getChartOptions(title, yAxisLabel) {
+    return {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+            legend: {
+                position: 'bottom',
+                labels: {
+                    padding: 20,
+                    usePointStyle: true,
+                    font: {
+                        size: 11
+                    },
+                    color: '#333'
+                }
+            },
+            tooltip: {
+                mode: 'index',
+                intersect: false,
+                backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                titleColor: '#fff',
+                bodyColor: '#fff',
+                callbacks: {
+                    label: function(context) {
+                        let label = context.dataset.label || '';
+                        if (label) {
+                            label += ': ';
+                        }
+                        label += context.parsed.y.toFixed(2) + ' ' + yAxisLabel;
+                        return label;
+                    }
+                }
+            }
+        },
+        scales: {
+            y: {
+                beginAtZero: true,
+                title: {
+                    display: true,
+                    text: yAxisLabel,
+                    font: {
+                        size: 12,
+                        weight: 'bold'
+                    },
+                    color: '#333'
+                },
+                grid: {
+                    color: 'rgba(0, 0, 0, 0.1)'
+                },
+                ticks: {
+                    color: '#333'
+                }
+            },
+            x: {
+                grid: {
+                    color: 'rgba(0, 0, 0, 0.1)'
+                },
+                title: {
+                    display: true,
+                    text: 'সময়',
+                    font: {
+                        size: 12,
+                        weight: 'bold'
+                    },
+                    color: '#333'
+                },
+                ticks: {
+                    color: '#333',
+                    maxTicksLimit: 10
+                }
+            }
+        },
+        animation: {
+            duration: 500,
+            easing: 'linear'
+        }
+    };
+}
+
+function updateCharts(data) {
+    if (!voltageChart || !currentChart) {
+        console.warn("Charts not initialized yet");
+        return;
+    }
+    
+    try {
+        const now = new Date();
+        const timeStr = now.toLocaleTimeString('bn-BD', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        });
+        
+        timeLabels.push(timeStr);
+        
+        voltageChart.data.datasets[0].data.push(parseFloat(data.solar_voltage) || 0);
+        voltageChart.data.datasets[1].data.push(parseFloat(data.battery_voltage) || 0);
+        voltageChart.data.datasets[2].data.push(parseFloat(data.load_voltage) || 0);
+        
+        currentChart.data.datasets[0].data.push(parseFloat(data.solar_current) || 0);
+        currentChart.data.datasets[1].data.push(parseFloat(data.battery_current) || 0);
+        currentChart.data.datasets[2].data.push(parseFloat(data.load_current) || 0);
+        
+        if (timeLabels.length > chartDataPoints) {
+            timeLabels.shift();
+            
+            voltageChart.data.datasets.forEach(dataset => dataset.data.shift());
+            currentChart.data.datasets.forEach(dataset => dataset.data.shift());
+        }
+        
+        voltageChart.data.labels = timeLabels;
+        currentChart.data.labels = timeLabels;
+        
+        voltageChart.update('none');
+        currentChart.update('none');
+        
+        console.log("📈 Charts updated with new data");
+        
+    } catch (error) {
+        console.error("❌ Error updating charts:", error);
+    }
+}
+
+function addDemoChartData() {
+    if (!voltageChart || !currentChart) return;
+    
+    console.log("📊 Adding demo chart data...");
+    
+    timeLabels = [];
+    voltageChart.data.labels = timeLabels;
+    currentChart.data.labels = timeLabels;
+    
+    voltageChart.data.datasets.forEach(dataset => dataset.data = []);
+    currentChart.data.datasets.forEach(dataset => dataset.data = []);
+    
+    for (let i = 0; i < 10; i++) {
+        const time = new Date(Date.now() - (10 - i) * 60000).toLocaleTimeString('bn-BD', {
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+        
+        timeLabels.push(time);
+        
+        voltageChart.data.datasets[0].data.push(24.5 + Math.random() * 2 - 1);
+        voltageChart.data.datasets[1].data.push(12.3 + Math.random() * 0.5 - 0.25);
+        voltageChart.data.datasets[2].data.push(12.1 + Math.random() * 0.3 - 0.15);
+        
+        currentChart.data.datasets[0].data.push(5.2 + Math.random() * 0.4 - 0.2);
+        currentChart.data.datasets[1].data.push(2.1 + Math.random() * 0.2 - 0.1);
+        currentChart.data.datasets[2].data.push(3.8 + Math.random() * 0.3 - 0.15);
+    }
+    
+    voltageChart.update();
+    currentChart.update();
+    
+    console.log("✅ Demo chart data added");
+}
+
+function updateBrushStatusDisplay() {
+    const brushStatusElement = document.getElementById('brushStatus');
+    const brushDirectionElement = document.getElementById('brushDirection');
+    const pumpStatusElement = document.getElementById('pumpStatus');
+    
+    if (brushStatusElement) {
+        brushStatusElement.textContent = brushStatus === 'stopped' ? 'বন্ধ' : 'চলছে';
+        brushStatusElement.style.color = brushStatus === 'stopped' ? '#F44336' : '#4CAF50';
+    }
+    
+    if (brushDirectionElement) {
+        if (brushStatus === 'forward') {
+            brushDirectionElement.textContent = 'ফরওয়ার্ড';
+            brushDirectionElement.style.color = '#4CAF50';
+        } else if (brushStatus === 'reverse') {
+            brushDirectionElement.textContent = 'রিভার্স';
+            brushDirectionElement.style.color = '#FF9800';
+        } else {
+            brushDirectionElement.textContent = '-';
+            brushDirectionElement.style.color = '#9E9E9E';
+        }
+    }
+    
+    if (pumpStatusElement) {
+        pumpStatusElement.textContent = pumpStatus === 'on' ? 'চালু' : 'বন্ধ';
+        pumpStatusElement.style.color = pumpStatus === 'on' ? '#4CAF50' : '#F44336';
+    }
+}
+
+// ==================== EMERGENCY STOP & RESET FUNCTIONS ====================
+
+function emergencyStop() {
+    console.log("🛑 Emergency Stop (জরুরি বন্ধ)!");
+    
+    stopAllIntervals();
+    
+    powerMode = 'stop';
+    activePowerSource = 'off';
+    
+    updateModeUI('stop');
+    updatePowerFlow('off');
+    
+    brushStatus = 'stopped';
+    pumpStatus = 'off';
+    updateBrushButtons();
+    updatePumpButtons();
+    
+    const indicator = document.getElementById('solarPriorityIndicator');
     if (indicator) {
-        indicator.className = `connection-dot ${isConnected ? 'connected' : 'disconnected'}`;
+        indicator.style.display = 'none';
     }
     
-    if (cloudStatus) {
-        cloudStatus.textContent = isConnected ? '☁️ ক্লাউড কানেক্টেড' : '☁️ ক্লাউড ডিসকানেক্টেড';
-        cloudStatus.style.color = isConnected ? '#4CAF50' : '#F44336';
+    addAlert({
+        type: 'error',
+        message: 'সিস্টেম জরুরি বন্ধ করা হয়েছে',
+        timestamp: new Date().toLocaleTimeString(),
+        priority: 'critical'
+    });
+    
+    const emergencyCommand = {
+        action: 'emergency_stop',
+        relays: {
+            relay1: false,
+            relay2: false,
+            relay3: false
+        },
+        reason: 'User initiated emergency stop (জরুরি বন্ধ)',
+        timestamp: Date.now(),
+        userId: userId || 'web_user',
+        emergency: true,
+        system_state: 'emergency_stopped'
+    };
+    
+    if (database && isConnected) {
+        const commandsRef = database.ref("solar_system/commands");
+        
+        commandsRef.set(emergencyCommand)
+            .then(() => {
+                console.log('✅ Emergency stop command sent');
+                showNotification('সিস্টেম জরুরি বন্ধ করা হয়েছে', 'error');
+                
+                updateFirebaseStatus('stop', 'off');
+                updateCurrentPowerSourceDisplay();
+                updateAllButtonStates();
+            })
+            .catch(error => {
+                console.error('❌ Emergency stop command error:', error);
+            });
     }
+}
+
+function resetFromEmergencyStop(mode, source = 'grid') {
+    console.log(`🔄 Resetting from emergency stop to ${mode} mode`);
+    
+    const resetCommand = {
+        action: 'reset_system',
+        mode: mode,
+        power_source: source,
+        timestamp: Date.now(),
+        userId: userId || 'web_user',
+        system_state: 'resetting',
+        emergency_reset: true,
+        sensor_data_request: true,
+        command: 'ENABLE_SENSORS'
+    };
+    
+    if (database && isConnected) {
+        const commandsRef = database.ref("solar_system/commands");
+        
+        commandsRef.set(resetCommand)
+            .then(() => {
+                console.log('✅ Reset command sent');
+                showNotification('সিস্টেম রিসেট করা হচ্ছে...', 'info');
+                
+                setTimeout(() => {
+                    powerMode = mode;
+                    activePowerSource = source;
+                    lastPowerSource = source;
+                    
+                    updateModeUI(mode);
+                    updatePowerFlow(source);
+                    updateAllButtonStates();
+                    
+                    setTimeout(() => {
+                        console.log("🔄 Force fetching data after reset...");
+                        forceDataFetchForAutoMode();
+                    }, 1500);
+                    
+                    if (mode === 'auto') {
+                        setTimeout(() => {
+                            console.log("🚀 Starting auto mode after reset...");
+                            startAutoPowerSwitching();
+                        }, 2000);
+                    }
+                    
+                    updateFirebaseStatus(mode, source);
+                    
+                    showNotification(`সিস্টেম রিসেট হয়েছে (${mode} মোড)`, 'success');
+                    
+                    addAlert({
+                        type: 'info',
+                        message: `সিস্টেম রিসেট করা হয়েছে (${mode} মোড)`,
+                        timestamp: new Date().toLocaleTimeString(),
+                        priority: 'low'
+                    });
+                }, 1000);
+            })
+            .catch(error => {
+                console.error('❌ Reset command error:', error);
+                showNotification('রিসেট কমান্ড পাঠাতে সমস্যা', 'error');
+            });
+    }
+}
+
+function manualStop() {
+    console.log("⏹️ Manual Stop (রিলে বন্ধ)");
+    
+    powerMode = 'manual';
+    activePowerSource = 'off';
+    
+    updateModeUI('manual');
+    updatePowerFlow('off');
+    
+    const indicator = document.getElementById('solarPriorityIndicator');
+    if (indicator) {
+        indicator.style.display = 'none';
+    }
+    
+    addAlert({
+        type: 'warning',
+        message: 'সিস্টেম ম্যানুয়ালি বন্ধ করা হয়েছে',
+        timestamp: new Date().toLocaleTimeString(),
+        priority: 'medium'
+    });
+    
+    const manualStopCommand = {
+        action: 'manual_stop',
+        relays: {
+            relay1: false,
+            relay2: false,
+            relay3: false
+        },
+        reason: 'User initiated manual stop (রিলে বন্ধ)',
+        timestamp: Date.now(),
+        userId: userId || 'web_user',
+        emergency: false
+    };
+    
+    if (database && isConnected) {
+        const commandsRef = database.ref("solar_system/commands");
+        
+        commandsRef.set(manualStopCommand)
+            .then(() => {
+                console.log('✅ Manual stop command sent');
+                showNotification('রিলে বন্ধ করা হয়েছে (ম্যানুয়াল স্টপ)', 'warning');
+                
+                updateCurrentPowerSourceDisplay();
+                updateFirebaseStatus('manual', 'off');
+                updateAllButtonStates();
+            })
+            .catch(error => {
+                console.error('❌ Manual stop command error:', error);
+            });
+    }
+}
+
+// ==================== INTERVAL MANAGEMENT ====================
+
+function stopAllIntervals() {
+    console.log("🛑 Stopping all intervals...");
+    
+    if (autoPowerInterval) {
+        clearInterval(autoPowerInterval);
+        autoPowerInterval = null;
+        console.log("✅ Auto power interval stopped");
+    }
+    
+    if (autoCheckInterval) {
+        clearInterval(autoCheckInterval);
+        autoCheckInterval = null;
+        console.log("✅ Auto check interval stopped");
+    }
+}
+
+// ==================== MONITORING FUNCTIONS ====================
+
+function startESP32Monitoring() {
+    setInterval(() => {
+        const now = Date.now();
+        if (esp32Connected && now - esp32LastDataTime > ESP32_TIMEOUT) {
+            console.log("⚠️ ESP32 connection timeout");
+            esp32Connected = false;
+            updateESP32Status(false);
+            
+            addAlert({
+                type: 'error',
+                message: 'ESP32 সংযোগ বিচ্ছিন্ন',
+                timestamp: new Date().toLocaleTimeString(),
+                priority: 'high'
+            });
+            
+            if (powerMode === 'auto') {
+                console.log("⚠️ Auto mode: ESP32 timeout, switching to grid");
+                if (activePowerSource !== 'grid') {
+                    executePowerSwitch('grid', 'ESP32 সংযোগ বিচ্ছিন্ন');
+                }
+            }
+        }
+    }, 10000);
+}
+
+function startDataValidityCheck() {
+    setInterval(() => {
+        const now = Date.now();
+        if (now - lastValidDataTime > AUTO_THRESHOLDS.DATA_TIMEOUT) {
+            console.log("⚠️ Data validity timeout - no valid data received");
+            
+            addAlert({
+                type: 'error',
+                message: 'ডেটা টাইমআউট - কোন ভ্যালিড ডেটা পাওয়া যায়নি',
+                timestamp: new Date().toLocaleTimeString(),
+                priority: 'high'
+            });
+            
+            if (powerMode === 'auto') {
+                console.log("⚠️ Auto mode: Data timeout, switching to grid");
+                if (activePowerSource !== 'grid') {
+                    executePowerSwitch('grid', 'ডেটা ভ্যালিডিটি টাইমআউট');
+                }
+            }
+        }
+    }, 30000);
 }
 
 function updateESP32Status(connected) {
-    const statusEl = document.querySelector('.network-status');
-    if (statusEl) {
-        statusEl.textContent = connected ? "কানেক্টেড" : "ডিসকানেক্টেড";
-        statusEl.className = `network-status ${connected ? 'connected' : 'disconnected'}`;
+    const cloudStatus = document.getElementById('cloud_status');
+    if (cloudStatus) {
+        if (connected) {
+            cloudStatus.innerHTML = '☁️ ESP32 সংযুক্ত';
+            cloudStatus.style.color = '#4CAF50';
+        } else {
+            cloudStatus.innerHTML = '☁️ ESP32 সংযোগ বিচ্ছিন্ন';
+            cloudStatus.style.color = '#F44336';
+        }
     }
 }
 
-function startESP32Monitoring() {
-    setInterval(checkESP32Connection, 5000);
-    checkESP32Connection();
-}
-
-function checkESP32Connection() {
-    const now = Date.now();
-    const timeDiff = now - esp32LastDataTime;
+function updateConnectionUI(connected) {
+    const connectionIndicator = document.getElementById('connectionIndicator');
+    const cloudStatus = document.getElementById('cloud_status');
     
-    if (esp32LastDataTime > 0 && timeDiff < ESP32_TIMEOUT) {
-        if (!esp32Connected) {
-            esp32Connected = true;
-            updateESP32Status(true);
-        }
-    } else if (esp32LastDataTime > 0 && timeDiff >= ESP32_TIMEOUT) {
-        if (esp32Connected) {
-            esp32Connected = false;
-            updateESP32Status(false);
-            showNotification("ESP32 সংযোগ বিচ্ছিন্ন", "warning");
+    if (connectionIndicator) {
+        connectionIndicator.className = connected ? 'connection-dot connected' : 'connection-dot disconnected';
+    }
+    
+    if (cloudStatus) {
+        if (connected) {
+            cloudStatus.innerHTML = '☁️ Firebase সংযুক্ত';
+            cloudStatus.style.color = '#4CAF50';
+        } else {
+            cloudStatus.innerHTML = '☁️ Firebase সংযোগ বিচ্ছিন্ন';
+            cloudStatus.style.color = '#F44336';
+            
+            addAlert({
+                type: 'error',
+                message: 'Firebase সংযোগ বিচ্ছিন্ন',
+                timestamp: new Date().toLocaleTimeString(),
+                priority: 'critical'
+            });
         }
     }
 }
 
-// ==================== NOTIFICATION ====================
+// ==================== NOTIFICATION SYSTEM ====================
 
 function showNotification(message, type = 'info') {
     console.log(`Notification (${type}): ${message}`);
@@ -1979,14 +3152,12 @@ function testAllButtons() {
         {id: 'manualModeBtn', type: 'mode'},
         {id: 'stopModeBtn', type: 'mode'},
         {id: 'brushAutoModeBtn', type: 'brush'},
-        {id: 'brushManualModeBtn', type: 'brush'},
+        {id: 'brushManualBtn', type: 'brush'},
         {id: 'brushForwardBtn', type: 'brush'},
         {id: 'brushReverseBtn', type: 'brush'},
         {id: 'brushPumpStopBtn', type: 'brush'},
         {id: 'pumpOnBtn', type: 'pump'},
-        {id: 'startCleaningBtn', type: 'auto-clean'},
-        {id: 'stopCleaningBtn', type: 'auto-clean'},
-        {selector: '.servo-control-btn', type: 'servo', count: document.querySelectorAll('.servo-control-btn').length},
+        {id: 'pumpOffBtn', type: 'pump'},
         {selector: '.power-source-btn', type: 'power', count: document.querySelectorAll('.power-source-btn').length}
     ];
     
@@ -2007,259 +3178,84 @@ function testAllButtons() {
     });
 }
 
-function addDebugButton() {
-    // Create debug button
-    const debugBtn = document.createElement('button');
-    debugBtn.id = 'debugButton';
-    debugBtn.innerHTML = '<i class="fas fa-bug"></i> ডিবাগ';
-    debugBtn.style.cssText = `
-        position: fixed;
-        bottom: 20px;
-        right: 20px;
-        z-index: 9999;
-        padding: 10px 15px;
-        background: #ff9800;
-        color: white;
-        border: none;
-        border-radius: 5px;
-        cursor: pointer;
-        font-weight: bold;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-    `;
+function debugAutoMode() {
+    console.log("=== AUTO MODE DEBUG ===");
+    console.log("Current Mode:", powerMode);
+    console.log("Active Power Source:", activePowerSource);
+    console.log("Solar Voltage:", currentSolarVoltage.toFixed(2), "V");
+    console.log("Battery Voltage:", currentBatteryVoltage.toFixed(2), "V");
+    console.log("Battery SOC:", currentBatterySOC.toFixed(1), "%");
+    console.log("Voltage Diff:", (currentSolarVoltage - currentBatteryVoltage).toFixed(2), "V");
+    console.log("Last Valid Data:", new Date(lastValidDataTime).toLocaleTimeString());
+    console.log("ESP32 Connected:", esp32Connected);
+    console.log("Firebase Connected:", isConnected);
+    console.log("Is Switching:", isSwitchingInProgress);
+    console.log("Solar Priority Blocks:", solarPriorityBlockCount);
+    console.log("Total Energy:", totalEnergyWh.toFixed(2), "Wh");
+    console.log("Alerts Count:", alerts.length);
+    console.log("======================");
     
-    debugBtn.addEventListener('click', function() {
-        debugAutoMode();
-    });
-    
-    document.body.appendChild(debugBtn);
+    showNotification(`ডিবাগ: ${powerMode} মোড, ${activePowerSource} সোর্স, সোলার: ${currentSolarVoltage.toFixed(2)}V`, "info");
 }
 
-// Debug function for auto mode
-window.debugAutoMode = function() {
-    console.log("=".repeat(60));
-    console.log("🐛 AUTO MODE DEBUG INFO");
-    console.log("=".repeat(60));
-    console.log("Power Mode:", powerMode);
-    console.log("Active Power Source:", activePowerSource);
-    console.log("Last Power Source:", lastPowerSource);
-    console.log("Firebase Connected:", isConnected);
-    console.log("ESP32 Connected:", esp32Connected);
-    console.log("Auto Interval Running:", autoPowerInterval !== null);
-    console.log("Switching in Progress:", isSwitchingInProgress);
-    console.log("Time since last switch:", Date.now() - lastSwitchTime, "ms");
-    console.log("");
-    console.log("📊 CURRENT SENSOR VALUES:");
-    console.log("Solar Voltage:", currentSolarVoltage);
-    console.log("Battery Voltage:", currentBatteryVoltage);
-    console.log("Battery SOC:", currentBatterySOC);
-    console.log("Solar Current:", solarCurrent);
-    console.log("Battery Current:", batteryCurrent);
-    console.log("Load Current:", loadCurrent);
-    console.log("");
-    console.log("📊 AUTO THRESHOLDS:");
-    console.log("SOLAR_MIN_VOLTAGE:", AUTO_THRESHOLDS.SOLAR_MIN_VOLTAGE);
-    console.log("BATTERY_MIN_VOLTAGE:", AUTO_THRESHOLDS.BATTERY_MIN_VOLTAGE);
-    console.log("BATTERY_CRITICAL_SOC:", AUTO_THRESHOLDS.BATTERY_CRITICAL_SOC);
-    console.log("BATTERY_LOW_SOC:", AUTO_THRESHOLDS.BATTERY_LOW_SOC);
-    console.log("SOLAR_BATTERY_DIFF:", AUTO_THRESHOLDS.SOLAR_BATTERY_DIFF);
-    console.log("MIN_SOLAR_VOLTAGE_FOR_SWITCH:", AUTO_THRESHOLDS.MIN_SOLAR_VOLTAGE_FOR_SWITCH);
-    console.log("GRID_TO_SOLAR_THRESHOLD:", AUTO_THRESHOLDS.GRID_TO_SOLAR_THRESHOLD);
-    console.log("SOLAR_TO_GRID_THRESHOLD:", AUTO_THRESHOLDS.SOLAR_TO_GRID_THRESHOLD);
-    console.log("=".repeat(60));
-    
-    // Check Firebase data
-    if (database && isConnected) {
-        database.ref('solar_system/current_data').once("value")
-            .then((snapshot) => {
-                const data = snapshot.val();
-                console.log("📊 Firebase Current Data:", data);
-            })
-            .catch(error => {
-                console.error("❌ Firebase data fetch error:", error);
-            });
+function updateSystemTime() {
+    const timeElement = document.getElementById('systemTime');
+    if (timeElement) {
+        const now = new Date();
+        const timeStr = now.toLocaleTimeString('bn-BD', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        });
+        timeElement.textContent = timeStr;
     }
-    
-    // Manually trigger auto check
-    if (powerMode === 'auto') {
-        console.log("🔄 Manually triggering auto check...");
-        checkAutoPowerConditions();
-    } else {
-        console.log("⚠️ Auto mode not active");
-    }
-};
+}
 
-// ==================== LOGOUT ====================
+// ==================== LOGOUT FUNCTION ====================
 
 function logout() {
-    if (confirm('আপনি কি লগআউট করতে চান?')) {
-        showNotification("লগআউট করা হচ্ছে...", "info");
-        
-        // Stop auto mode
-        stopAllIntervals();
-        
-        if (auth) {
-            auth.signOut().then(() => {
-                localStorage.removeItem('solar_user_logged_in');
-                localStorage.removeItem('solar_user_email');
-                localStorage.removeItem('solar_user_uid');
-                window.location.href = 'login.html';
-            });
-        } else {
-            window.location.href = 'login.html';
+    const confirmLogout = confirm("আপনি কি নিশ্চিতভাবে লগআউট করতে চান?");
+
+    if (!confirmLogout) {
+        // না চাপলে কিছুই হবে না
+        return;
+    }
+
+    firebase.auth().signOut()
+        .then(() => {
+            console.log("✅ Logout successful");
+
+            // UI update
+            const emailSpan = document.getElementById("userEmailDisplay");
+            if (emailSpan) {
+                emailSpan.textContent = "লগইন করা নেই";
+            }
+
+            // Redirect to login page
+            window.location.href = "login.html";
+        })
+        .catch((error) => {
+            console.error("❌ Logout error:", error);
+            alert("লগআউট করতে সমস্যা হয়েছে");
+        });
+}
+
+
+firebase.auth().onAuthStateChanged((user) => {
+    const emailSpan = document.getElementById("userEmailDisplay");
+
+    if (user) {
+        console.log("👤 Logged in:", user.email);
+        if (emailSpan) {
+            emailSpan.textContent = user.email;
         }
-    }
-}
-
-
-// dashboard.js এ যোগ করুন
-
-// ==================== SAFETY ALERT FUNCTIONS ====================
-
-function showSafetyAlert(type, message, action = null) {
-    const alertDiv = document.getElementById('safety_alert');
-    if (!alertDiv) return;
-    
-    const alertTypes = {
-        'emergency': 'alert-emergency',
-        'warning': 'alert-warning',
-        'danger': 'alert-danger',
-        'info': 'alert-info'
-    };
-    
-    const icons = {
-        'emergency': '⚠️',
-        'warning': '🔥',
-        'danger': '⚡',
-        'info': 'ℹ️'
-    };
-    
-    let actionButton = '';
-    if (action) {
-        actionButton = `<button onclick="${action.function}">${action.text}</button>`;
-    }
-    
-    alertDiv.innerHTML = `
-        <div class="${alertTypes[type] || 'alert-info'}">
-            ${icons[type] || 'ℹ️'} <strong>${type.toUpperCase()}:</strong> ${message}
-            ${actionButton}
-        </div>
-    `;
-    alertDiv.style.display = 'block';
-    
-    // অটো হাইড করার টাইমার
-    if (type !== 'emergency') {
-        setTimeout(() => {
-            hideSafetyAlert();
-        }, 10000); // 10 সেকেন্ড পর হাইড
-    }
-}
-
-function hideSafetyAlert() {
-    const alertDiv = document.getElementById('safety_alert');
-    if (alertDiv) {
-        alertDiv.style.display = 'none';
-    }
-}
-
-// ==================== SAFETY CHECKS ====================
-
-function checkSafetyConditions(data) {
-    if (!data) return;
-    
-    // ১. ব্যাটারি SOC চেক
-    if (data.battery_soc < 15) {
-        showSafetyAlert('emergency', 
-            `ব্যাটারি SOC ${data.battery_soc}%! সিস্টেম বন্ধ হতে পারে`,
-            { text: 'গ্রিডে সুইচ', function: 'switchToGridPower()' }
-        );
-    }
-    
-    // ২. অতিরিক্ত তাপমাত্রা চেক
-    if (data.temperature > 60) {
-        showSafetyAlert('danger',
-            `তাপমাত্রা ${data.temperature}°C! সিস্টেম গরম`,
-            { text: 'ফ্যান চালু', function: 'turnOnCoolingFan()' }
-        );
-    }
-    
-    // ৩. অতিরিক্ত কারেন্ট চেক
-    if (data.load_current > 20) {
-        showSafetyAlert('warning',
-            `লোড কারেন্ট ${data.load_current.toFixed(2)}A! অতিরিক্ত লোড`,
-            { text: 'লোড কমান', function: 'reduceLoad()' }
-        );
-    }
-    
-    // ৪. ভোল্টেজ ফ্লাকচুয়েশন চেক
-    if (data.solar_voltage > 18 || data.battery_voltage > 15) {
-        showSafetyAlert('danger',
-            `ভোল্টেজ বেশি: সোলার ${data.solar_voltage}V, ব্যাটারি ${data.battery_voltage}V`,
-            { text: 'সিস্টেম চেক', function: 'checkSystemStatus()' }
-        );
-    }
-}
-
-// ==================== FIREBASE LISTENER এ যোগ করুন ====================
-
-function setupRealtimeListenersCompat() {
-    // ... existing code ...
-    
-    const currentDataRef = database.ref('solar_system/current_data');
-    currentDataRef.on("value", (snapshot) => {
-        const data = snapshot.val();
-        if (data) {
-            // ... existing updates ...
-            
-            // সেফটি চেক করুন
-            checkSafetyConditions(data);
+    } else {
+        console.log("🚪 User logged out");
+        if (emailSpan) {
+            emailSpan.textContent = "লগইন করা নেই";
         }
-    });
-    
-    // ... rest of the code ...
-}
 
-// ==================== ACTION FUNCTIONS ====================
-
-function switchToGridPower() {
-    console.log("গ্রিডে সুইচ করা হচ্ছে...");
-    controlPowerSource('grid', 'on', 'সুরক্ষা সতর্কতা');
-    hideSafetyAlert();
-}
-
-function turnOnCoolingFan() {
-    console.log("কুলিং ফ্যান চালু করা হচ্ছে...");
-    // ফ্যান কন্ট্রোল কোড
-    hideSafetyAlert();
-}
-
-function reduceLoad() {
-    console.log("লোড কমানো হচ্ছে...");
-    // লোড রিডিউস কোড
-    hideSafetyAlert();
-}
-
-function checkSystemStatus() {
-    console.log("সিস্টেম স্ট্যাটাস চেক করা হচ্ছে...");
-    refreshSystemStatus();
-    hideSafetyAlert();
-}
-
-// ==================== EXPORT FUNCTIONS ====================
-
-window.startAutoPowerSwitching = startAutoPowerSwitching;
-window.stopAutoPowerSwitching = stopAutoPowerSwitching;
-window.controlPowerSource = controlPowerSource;
-window.switchToSolarPower = switchToSolarPower;
-window.switchToBatteryPower = switchToBatteryPower;
-window.switchToGridPower = switchToGridPower;
-window.emergencyStop = emergencyStop;
-window.manualStop = manualStop;
-window.logout = logout;
-window.testAllButtons = testAllButtons;
-window.initControlPanel = initControlPanel;
-window.debugAutoMode = debugAutoMode;
-window.showNotification = showNotification;
-window.switchToMode = switchToMode;
-window.refreshSystemStatus = refreshSystemStatus;
-
-console.log("✅ Solar Dashboard script loaded successfully");
+        // Dashboard protect করতে চাইলে
+        window.location.href = "login.html";
+    }
+});
